@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "提示词缓存保活",
+    "description": "主会话空闲时自动重放最近一次请求，保持提示词缓存有效。",
+    "detail": "detail.md"
+  }
+}

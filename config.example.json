@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "intervalMinutes": 20,
+  "maxIdleMinutes": 150,
+  "maxTouches": 8,
+  "replayMaxTokens": 1,
+  "scanSeconds": 30,
+  "maxSessions": 1,
+  "routes": [
+    { "provider": "kimi-coding", "model": "kimi-k3.1-pro" }
+  ]
+}

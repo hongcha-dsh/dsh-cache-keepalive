@@ -1,0 +1,21 @@
+{
+  "name": "dsh-cache-keepalive",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "主会话空闲时自动重放最近一次请求，保持提示词缓存有效。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "config.example.json", "README.md", "detail.md"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
