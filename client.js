@@ -61,7 +61,11 @@ window.__ModuleLoader__.load({
 
       function money(value) {
         if (value === null || value === undefined) return '—';
-        return '¥' + Number(value).toFixed(3);
+        const amount = Number(value);
+        if (!Number.isFinite(amount)) return '—';
+        const absolute = Math.abs(amount);
+        const digits = absolute > 0 && absolute < 0.01 ? 4 : 3;
+        return (amount < 0 ? '-¥' : '¥') + absolute.toFixed(digits);
       }
       function tokens(value) {
         if (value === null || value === undefined) return '—';
@@ -70,6 +74,14 @@ window.__ModuleLoader__.load({
       function clock(ts) {
         try {
           return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false });
+        } catch {
+          return String(ts);
+        }
+      }
+      function clockDate(ts) {
+        if (!ts) return '—';
+        try {
+          return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
         } catch {
           return String(ts);
         }
@@ -130,7 +142,7 @@ window.__ModuleLoader__.load({
             h(Metric, { title: '命中率', value: stats.hitRate === null || stats.hitRate === undefined ? '—' : Math.round(stats.hitRate * 100) + '%' }),
             h(Metric, { title: '累计缓存读取', value: tokens(stats.cacheRead) }),
             h(Metric, { title: '估算花费', value: money(stats.costEstimate) }),
-            h(Metric, { title: '估算省下', value: money(stats.avoidedEstimate) })
+            h(Metric, { title: '估算净省', value: money(stats.savedEstimate) })
           ),
 
           h('div', { style: card },
@@ -171,29 +183,154 @@ window.__ModuleLoader__.load({
 
           h('div', { style: card },
             h('div', { style: row }, h('span', { style: label }, '当前跟踪的会话'), state && state.sessions && state.sessions.length > 0
-              ? h('span', { style: { fontSize: 12 } }, state.sessions.map((s) => s.session + ' · ' + (s.provider || '?') + '/' + (s.model || '?') + ' · 空闲 ' + s.idleMinutes + ' 分钟 · 已保活 ' + s.touches + ' 次' + (s.armed ? '' : ' · 待首次命中') + (s.stopped ? ' · 已停' : '')).join('；'))
+              ? h('span', { style: { fontSize: 12 } }, state.sessions.map((s) => (s.title ? s.title + ' · ' : '') + s.session + ' · ' + (s.provider || '?') + '/' + (s.model || '?') + ' · 空闲 ' + s.idleMinutes + ' 分钟 · 已保活 ' + s.touches + ' 次' + (s.armed ? '' : ' · 待首次命中') + (s.stopped ? ' · 已停' : '')).join('；'))
               : h('span', { style: { fontSize: 12, opacity: 0.55 } }, '暂无（等下一次真实请求）'))
           ),
 
           h('div', { style: card },
-            h('span', { style: label }, '最近保活'),
-            (state && state.recent && state.recent.length > 0)
-              ? h('table', { style: { borderCollapse: 'collapse' } },
-                h('thead', null, h('tr', null,
-                  h('th', { style: th }, '时间'), h('th', { style: th }, '结果'), h('th', { style: th }, '缓存读取'),
-                  h('th', { style: th }, '未命中'), h('th', { style: th }, '输出'), h('th', { style: th }, '花费'), h('th', { style: th }, '省下'))),
-                h('tbody', null, state.recent.map((r, index) => h('tr', { key: index },
-                  h('td', { style: td }, clock(r.ts)),
-                  h('td', { style: td }, r.status === 'hit' ? '命中' : r.status === 'miss' ? '未命中' : r.status === 'error' ? '错误' : '未知'),
-                  h('td', { style: td }, tokens(r.cacheRead)),
-                  h('td', { style: td }, tokens(r.input)),
-                  h('td', { style: td }, tokens(r.output)),
-                  h('td', { style: td }, money(r.cost)),
-                  h('td', { style: td }, money(r.avoided))
-                )))
-              )
-              : h('span', { style: { ...label, margin: 0 } }, '还没有保活记录。')
+            h('div', { style: row },
+              h('span', { style: label }, '保活记录'),
+              h('span', { style: { ...label, opacity: 0.45 } }, state && state.tasks && state.tasks.length > 0 ? '按任务记录 · 点一条看明细' : '')
+            ),
+            h(TaskRecords, { tasks: (state && state.tasks) || [], onChanged: refresh })
           )
+        );
+      }
+
+      // One record per task (= one conversation). The row carries the task title,
+      // the keepalive count and the net saving; clicking it loads the per-touch
+      // detail from the Host, and 删除 drops that task's record.
+      function TaskRecords({ tasks, onChanged }) {
+        const [openId, setOpenId] = React.useState(null);
+        const [detail, setDetail] = React.useState(null);
+        const [error, setError] = React.useState(null);
+        const [confirmId, setConfirmId] = React.useState(null);
+        const [busy, setBusy] = React.useState(false);
+
+        const loadDetail = React.useCallback(async (id) => {
+          setDetail(null);
+          setError(null);
+          try {
+            const res = await fetch(API + '/task?session=' + encodeURIComponent(id), { cache: 'no-store' });
+            const json = await res.json();
+            if (!res.ok) throw new Error((json && json.error) || 'HTTP ' + res.status);
+            setDetail(json);
+          } catch (e) {
+            setError(String((e && e.message) || e));
+          }
+        }, []);
+
+        const toggle = (id) => {
+          setConfirmId(null);
+          if (openId === id) {
+            setOpenId(null);
+            setDetail(null);
+            return;
+          }
+          setOpenId(id);
+          void loadDetail(id);
+        };
+
+        const remove = async (id) => {
+          setBusy(true);
+          setError(null);
+          try {
+            const res = await fetch(API + '/task/delete', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ session: id })
+            });
+            const json = await res.json();
+            if (!res.ok || !json.ok) throw new Error((json && json.error) || 'HTTP ' + res.status);
+            if (openId === id) {
+              setOpenId(null);
+              setDetail(null);
+            }
+            setConfirmId(null);
+            if (onChanged) await onChanged();
+          } catch (e) {
+            setError('删除失败：' + String((e && e.message) || e));
+          } finally {
+            setBusy(false);
+          }
+        };
+
+        if (tasks.length === 0) {
+          return h('span', { style: { ...label, margin: 0 } }, '还没有保活记录。开启后每个任务单独记一条，点进去看每次保活的明细。');
+        }
+
+        return h('div', { style: { display: 'flex', flexDirection: 'column' } },
+          tasks.map((task) => {
+            const open = openId === task.id;
+            return h('div', { key: task.id, style: { borderTop: '1px solid rgba(127,127,127,0.18)', paddingTop: 2 } },
+              h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                h('button', {
+                  type: 'button',
+                  title: open ? '收起明细' : '展开每次保活的明细',
+                  onClick: () => toggle(task.id),
+                  style: { flex: 1, display: 'flex', gap: 8, alignItems: 'center', padding: '5px 2px', color: 'inherit', background: 'transparent', border: 'none', cursor: 'pointer', font: 'inherit', textAlign: 'left', minWidth: 0 }
+                },
+                  h('span', { style: { opacity: 0.5, fontSize: 11, width: 10, flex: '0 0 auto' } }, open ? '▾' : '▸'),
+                  h('span', { style: { fontWeight: 600, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.title),
+                  h('span', { style: { ...label, whiteSpace: 'nowrap' } }, tokens(task.touches) + ' 次'),
+                  h('span', { style: { ...label, whiteSpace: 'nowrap', opacity: task.saved > 0 ? 0.75 : 0.5 } }, '省 ' + money(task.saved)),
+                  h('span', { style: { ...label, whiteSpace: 'nowrap', opacity: 0.45 } }, clockDate(task.lastAt))
+                ),
+                h('button', {
+                  type: 'button',
+                  disabled: busy,
+                  title: '删除这条记录（只删记录，不影响保活开关）',
+                  onClick: () => (confirmId === task.id ? void remove(task.id) : setConfirmId(task.id)),
+                  onMouseLeave: () => {
+                    if (confirmId === task.id) setConfirmId(null);
+                  },
+                  style: { ...button, padding: '1px 8px', fontSize: 12, whiteSpace: 'nowrap', borderColor: confirmId === task.id ? '#c4553b' : 'rgba(127,127,127,0.35)', color: confirmId === task.id ? '#c4553b' : 'inherit' }
+                }, confirmId === task.id ? '确认删除' : '删除')
+              ),
+              open
+                ? (detail && detail.task && detail.task.id === task.id
+                  ? h(TaskDetail, { detail })
+                  : h('div', { style: { ...label, padding: '2px 0 8px 20px' } }, error || '加载中…'))
+                : null
+            );
+          })
+        );
+      }
+
+      function TaskDetail({ detail }) {
+        const task = detail.task;
+        const records = (detail.records || []).slice().reverse();
+        return h('div', { style: { padding: '0 0 10px 20px', display: 'flex', flexDirection: 'column', gap: 8 } },
+          h('div', { style: grid },
+            h(Metric, { title: '保活次数', value: tokens(task.touches) }),
+            h(Metric, { title: '命中 / 未命中', value: tokens(task.hits) + ' / ' + tokens(task.misses) }),
+            h(Metric, { title: '缓存读取', value: tokens(task.cacheRead) }),
+            h(Metric, { title: '花费', value: money(task.cost) }),
+            h(Metric, { title: '净省', value: money(task.saved) }),
+            h(Metric, { title: '最近一次', value: clockDate(task.lastAt) })
+          ),
+          h('div', { style: { ...label, display: 'flex', gap: 12, flexWrap: 'wrap' } },
+            h('span', null, '模型 ' + (task.provider || '?') + ' / ' + (task.model || '?')),
+            h('span', null, '首次 ' + clockDate(task.firstAt))
+          ),
+          h('table', { style: { borderCollapse: 'collapse' } },
+            h('thead', null, h('tr', null,
+              h('th', { style: th }, '时间'), h('th', { style: th }, '第几次'), h('th', { style: th }, '结果'),
+              h('th', { style: th }, '缓存读取'), h('th', { style: th }, '未命中'), h('th', { style: th }, '输出'),
+              h('th', { style: th }, '花费'), h('th', { style: th }, '耗时'))),
+            h('tbody', null, records.map((record, index) => h('tr', { key: index },
+              h('td', { style: td }, clock(record.ts)),
+              h('td', { style: td }, record.touch === null ? '—' : String(record.touch)),
+              h('td', { style: td }, record.status === 'hit' ? '命中' : record.status === 'miss' ? '未命中' : record.status === 'error' ? '错误' : '未知'),
+              h('td', { style: td }, tokens(record.cacheRead)),
+              h('td', { style: td }, tokens(record.input)),
+              h('td', { style: td }, tokens(record.output)),
+              h('td', { style: td }, money(record.cost)),
+              h('td', { style: td }, record.ms === null || record.ms === undefined ? '—' : (record.ms / 1000).toFixed(1) + 's')
+            )))
+          ),
+          h('p', { style: { ...label, margin: 0 } },
+            '净省 = 每次空闲期保住缓存所避免的一次未命中花费 − 该空闲期所有保活花费（缓存读取按未命中价的 1/10 计）。')
         );
       }
 

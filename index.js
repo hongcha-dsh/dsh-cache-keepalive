@@ -105,21 +105,47 @@ export function apply(ctx) {
 
   // ---- status surface (settings page card) ----
   const startedAt = Date.now();
-  /** In-memory ring of the latest keepalive outcomes for the settings card. */
-  const recent = [];
-  const stats = { touches: 0, hits: 0, misses: 0, unknown: 0, errors: 0, cacheRead: 0, input: 0, output: 0 };
+  /** Every keepalive outcome on disk plus live ones: drives the per-task records. */
+  const history = [];
+  const HISTORY_MAX = 5000;
+  const EMPTY_STATS = { touches: 0, hits: 0, misses: 0, unknown: 0, errors: 0, cacheRead: 0, input: 0, output: 0, cost: 0 };
+  const stats = { ...EMPTY_STATS };
+  /** sessionId -> last title seen in the log file (sessions no longer in memory). */
+  const storedTitles = new Map();
+  /** sessionId -> { title, scannedSeq }: incremental reader of `session/title` events. */
+  const titleCache = new Map();
   /** Browser-side diagnostics reported by client.js (bundle load, slot registration errors). */
   const clientDiagnostics = [];
-  /** CNY per 1M tokens, kimi-coding list price; only used for the estimate label. */
+  /** CNY per 1M tokens, kimi-coding list price; only used for the estimate labels. */
   const PRICE = { hit: 1.3, input: 13, output: 68 };
+
+  function priceOf(record) {
+    return ((record.cacheRead ?? 0) * PRICE.hit + (record.input ?? 0) * PRICE.input + (record.output ?? 0) * PRICE.output) / 1e6;
+  }
   function remember(record) {
-    recent.push(record);
-    if (recent.length > 40) recent.shift();
+    history.push(record);
+    if (history.length > HISTORY_MAX) history.shift();
+  }
+  function addToStats(record) {
+    stats.touches += 1;
+    if (record.status === 'hit') stats.hits += 1;
+    else if (record.status === 'miss') stats.misses += 1;
+    else if (record.status === 'unknown') stats.unknown += 1;
+    else stats.errors += 1;
+    stats.cacheRead += record.cacheRead ?? 0;
+    stats.input += record.input ?? 0;
+    stats.output += record.output ?? 0;
+    stats.cost += priceOf(record);
+  }
+  function recomputeStats() {
+    for (const key of Object.keys(stats)) stats[key] = 0;
+    for (const record of history) addToStats(record);
   }
   function loadHistory() {
     try {
-      const lines = fs.readFileSync(LOG_PATH, 'utf8').trim().split(/\r?\n/);
-      for (const line of lines.slice(-40)) {
+      const lines = fs.readFileSync(LOG_PATH, 'utf8').split(/\r?\n/);
+      for (const line of lines) {
+        if (line.trim().length === 0) continue;
         let record;
         try {
           record = JSON.parse(line);
@@ -128,23 +154,16 @@ export function apply(ctx) {
         }
         if (record === null || record.kind !== 'keepalive') continue;
         remember(record);
-        stats.touches += 1;
-        if (record.status === 'hit') stats.hits += 1;
-        else if (record.status === 'miss') stats.misses += 1;
-        else if (record.status === 'unknown') stats.unknown += 1;
-        else stats.errors += 1;
-        stats.cacheRead += record.cacheRead ?? 0;
-        stats.input += record.input ?? 0;
-        stats.output += record.output ?? 0;
+        if (typeof record.session === 'string' && typeof record.title === 'string' && record.title.length > 0) {
+          storedTitles.set(record.session, record.title);
+        }
       }
     } catch {
       /* no history yet */
     }
+    recomputeStats();
   }
   loadHistory();
-  function priceOf(record) {
-    return ((record.cacheRead ?? 0) * PRICE.hit + (record.input ?? 0) * PRICE.input + (record.output ?? 0) * PRICE.output) / 1e6;
-  }
 
   function routeKeyOf(provider, model) {
     return String(provider) + '/' + String(model);
@@ -187,6 +206,53 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * The task name shown in the record list is the conversation's title: the log
+   * carries `session/title` events and the last one wins. Reading is incremental
+   * (`scannedSeq`), so a poll on a large session only slices new events.
+   */
+  function sessionTitle(sessionId) {
+    try {
+      const session = sessionsService()?.get(sessionId);
+      if (session === undefined || session === null) return null;
+      // The session-title service folds `session/title` events for us; the log
+      // scan below is only the fallback when that service is unavailable.
+      try {
+        const service = ctx.get('sessionTitle');
+        const snapshot = service?.get?.(session);
+        if (snapshot !== undefined && snapshot !== null && typeof snapshot.title === 'string' && snapshot.title.trim().length > 0) {
+          return snapshot.title.trim();
+        }
+      } catch {
+        /* fall through to the log scan */
+      }
+      const cached = titleCache.get(sessionId);
+      const from = cached === undefined ? 0 : cached.scannedSeq;
+      let events = [];
+      try {
+        if (typeof session.snapshotEvents === 'function') events = session.snapshotEvents(from);
+        else if (Array.isArray(session.log)) events = session.log.slice(from);
+      } catch {
+        events = [];
+      }
+      let title = cached === undefined ? null : cached.title;
+      let scanned = from;
+      for (let index = 0; index < events.length; index += 1) {
+        const event = events[index];
+        if (event === null || typeof event !== 'object') continue;
+        const seq = typeof event.seq === 'number' ? event.seq : from + index;
+        if (seq + 1 > scanned) scanned = seq + 1;
+        if (event.type !== 'session/title') continue;
+        const value = event.data && typeof event.data.title === 'string' ? event.data.title.trim() : '';
+        if (value.length > 0) title = value;
+      }
+      titleCache.set(sessionId, { title, scannedSeq: scanned });
+      return title;
+    } catch {
+      return null;
+    }
+  }
+
   function routeAllowed(provider, model) {
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (routes.length === 0) return true;
@@ -197,6 +263,136 @@ export function apply(ctx) {
     if (sessions.size <= cfg.maxSessions) return;
     const newestFirst = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt);
     for (const [sessionId] of newestFirst.slice(cfg.maxSessions)) sessions.delete(sessionId);
+  }
+
+  /**
+   * Net saving of one idle gap. Keeping a cache warm saves exactly one miss
+   * (C tokens billed at the input price) and costs `touches` cache reads
+   * (C tokens at the hit price), so net = C * hit * (R - touches), R = input/hit.
+   * A gap whose only outcomes were misses/errors saved nothing and cost cash.
+   */
+  const PRICE_RATIO = PRICE.input / PRICE.hit;
+  function summarizeSession(records) {
+    const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
+    const gaps = [];
+    let previousTouch = 0;
+    for (const record of records) {
+      const cost = priceOf(record);
+      summary.touches += 1;
+      summary.cost += cost;
+      summary.cacheRead += record.cacheRead ?? 0;
+      summary.input += record.input ?? 0;
+      summary.output += record.output ?? 0;
+      if (record.status === 'hit') summary.hits += 1;
+      else if (record.status === 'miss') summary.misses += 1;
+      else if (record.status === 'error') summary.errors += 1;
+      else summary.unknown += 1;
+      const touch = Number(record.touch) || 0;
+      let gap = gaps[gaps.length - 1];
+      // `touch` restarts at 1 whenever a real request re-captures the session.
+      if (gap === undefined || touch <= previousTouch) {
+        gap = { touches: 0, cache: 0, hit: false, cost: 0 };
+        gaps.push(gap);
+      }
+      previousTouch = touch;
+      gap.touches = Math.max(gap.touches, touch);
+      gap.cost += cost;
+      if (record.status === 'hit' && (record.cacheRead ?? 0) > 0) {
+        gap.cache = Math.max(gap.cache, record.cacheRead);
+        gap.hit = true;
+      }
+    }
+    for (const gap of gaps) {
+      summary.saved += gap.hit
+        ? (gap.cache * Math.max(0, PRICE_RATIO - gap.touches) * PRICE.hit) / 1e6
+        : -gap.cost;
+    }
+    summary.cost = +summary.cost.toFixed(6);
+    summary.saved = +summary.saved.toFixed(6);
+    return summary;
+  }
+
+  /** One record per task (conversation), newest first. */
+  function buildTasks() {
+    const groups = new Map();
+    for (const record of history) {
+      const sessionId = record.session;
+      if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+      let group = groups.get(sessionId);
+      if (group === undefined) {
+        group = [];
+        groups.set(sessionId, group);
+      }
+      group.push(record);
+    }
+    const tasks = [];
+    for (const [sessionId, records] of groups) {
+      const latest = records[records.length - 1];
+      const title = sessionTitle(sessionId)
+        ?? storedTitles.get(sessionId)
+        ?? (typeof latest?.title === 'string' ? latest.title : '');
+      tasks.push({
+        id: sessionId,
+        title: title.length > 0 ? title : '会话 ' + sessionId.replace(/^session-/, '').slice(0, 8),
+        provider: latest?.provider ?? null,
+        model: latest?.model ?? null,
+        firstAt: records[0]?.ts ?? null,
+        lastAt: latest?.ts ?? null,
+        ...summarizeSession(records)
+      });
+    }
+    tasks.sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
+    return tasks;
+  }
+
+  /** Per-touch detail of one task record, oldest first (last 200). */
+  function taskRecords(sessionId) {
+    return history
+      .filter((record) => record.session === sessionId)
+      .slice(-200)
+      .map((record) => ({
+        ts: record.ts,
+        touch: record.touch ?? null,
+        status: record.status,
+        cacheRead: record.cacheRead ?? null,
+        input: record.input ?? null,
+        output: record.output ?? null,
+        ms: record.ms ?? null,
+        cost: +priceOf(record).toFixed(6)
+      }));
+  }
+
+  /** Forget one task: drop its keepalive lines from disk and stop its current idle gap. */
+  function deleteTask(sessionId) {
+    try {
+      let kept = [];
+      try {
+        const raw = fs.readFileSync(LOG_PATH, 'utf8');
+        kept = raw.split(/\r?\n/).filter((line) => {
+          if (line.trim().length === 0) return false;
+          try {
+            const record = JSON.parse(line);
+            return !(record !== null && typeof record === 'object' && record.session === sessionId);
+          } catch {
+            return true;
+          }
+        });
+      } catch {
+        kept = [];
+      }
+      fs.writeFileSync(LOG_PATH, kept.length > 0 ? kept.join('\n') + '\n' : '');
+      for (let index = history.length - 1; index >= 0; index -= 1) {
+        if (history[index].session === sessionId) history.splice(index, 1);
+      }
+      storedTitles.delete(sessionId);
+      titleCache.delete(sessionId);
+      sessions.delete(sessionId);
+      recomputeStats();
+      return true;
+    } catch (error) {
+      ctx.logger?.warn?.('cache-keepalive: delete record failed: ' + String(error?.message ?? error));
+      return false;
+    }
   }
 
   function capture(options) {
@@ -211,21 +407,24 @@ export function apply(ctx) {
 
     const now = Date.now();
     const existing = sessions.get(sessionId);
+    const title = sessionTitle(sessionId);
     if (existing === undefined) {
       sessions.set(sessionId, {
         snapshot: options,
         lastRealAt: now,
         touches: 0,
         nextDueAt: now + intervalFor(options.provider, options.model),
-        stopped: false
+        stopped: false,
+        title
       });
-      appendLog({ kind: 'capture', session: sessionId, provider: options.provider, model: options.model, messages: Array.isArray(options.messages) ? options.messages.length : null, toolHistory: Array.isArray(options.toolHistory) ? options.toolHistory.length : null, tools: Array.isArray(options.tools) ? options.tools.length : null });
+      appendLog({ kind: 'capture', session: sessionId, title, provider: options.provider, model: options.model, messages: Array.isArray(options.messages) ? options.messages.length : null, toolHistory: Array.isArray(options.toolHistory) ? options.toolHistory.length : null, tools: Array.isArray(options.tools) ? options.tools.length : null });
     } else {
       existing.snapshot = options;
       existing.lastRealAt = now;
       existing.touches = 0;
       existing.nextDueAt = now + intervalFor(options.provider, options.model);
       existing.stopped = false;
+      if (title !== null && title.length > 0) existing.title = title;
     }
     prune();
   }
@@ -291,6 +490,8 @@ export function apply(ctx) {
     busy = true;
     entry.touches += 1;
     entry.nextDueAt = now + intervalFor(entry.snapshot.provider, entry.snapshot.model);
+    const title = sessionTitle(sessionId) ?? entry.title ?? storedTitles.get(sessionId) ?? null;
+    if (title !== null) entry.title = title;
     const startedAt = Date.now();
     let usage = null;
     let finishReason = null;
@@ -304,7 +505,7 @@ export function apply(ctx) {
     } catch (error) {
       busy = false;
       entry.stopped = true;
-      appendLog({ kind: 'keepalive', session: sessionId, provider: entry.snapshot.provider, model: entry.snapshot.model, touch: entry.touches, status: 'error', error: String(error?.message ?? error) });
+      appendLog({ kind: 'keepalive', session: sessionId, title, provider: entry.snapshot.provider, model: entry.snapshot.model, touch: entry.touches, status: 'error', error: String(error?.message ?? error) });
       return;
     }
     busy = false;
@@ -318,6 +519,7 @@ export function apply(ctx) {
       ts: new Date().toISOString(),
       kind: 'keepalive',
       session: sessionId,
+      title,
       provider: entry.snapshot.provider,
       model: entry.snapshot.model,
       touch: entry.touches,
@@ -330,14 +532,8 @@ export function apply(ctx) {
     };
     appendLog(record);
     remember(record);
-    stats.touches += 1;
-    if (status === 'hit') stats.hits += 1;
-    else if (status === 'miss') stats.misses += 1;
-    else if (status === 'unknown') stats.unknown += 1;
-    else stats.errors += 1;
-    stats.cacheRead += cacheRead ?? 0;
-    stats.input += input ?? 0;
-    stats.output += output ?? 0;
+    if (title !== null) storedTitles.set(sessionId, title);
+    addToStats(record);
     if (failed) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'replay-error' });
@@ -374,23 +570,8 @@ export function apply(ctx) {
   });
 
   function stateSnapshot() {
-    const avoidedOf = (record) => (record.status === 'hit' ? ((record.cacheRead ?? 0) * (PRICE.input - PRICE.hit)) / 1e6 : 0);
-    const recentPublic = recent
-      .slice(-20)
-      .reverse()
-      .map((record) => ({
-        ts: record.ts,
-        status: record.status,
-        cacheRead: record.cacheRead,
-        input: record.input,
-        output: record.output,
-        touch: record.touch,
-        ms: record.ms,
-        cost: +priceOf(record).toFixed(5),
-        avoided: +avoidedOf(record).toFixed(5)
-      }));
-    const cost = recent.reduce((sum, record) => sum + priceOf(record), 0);
-    const avoided = recent.reduce((sum, record) => sum + avoidedOf(record), 0);
+    const tasks = buildTasks();
+    const saved = tasks.reduce((sum, task) => sum + task.saved, 0);
     return {
       now: Date.now(),
       startedAt,
@@ -416,6 +597,7 @@ export function apply(ctx) {
       })),
       sessions: [...sessions.entries()].map(([sessionId, entry]) => ({
         session: String(sessionId).slice(0, 18),
+        title: entry.title ?? sessionTitle(sessionId) ?? null,
         provider: entry.snapshot?.provider,
         model: entry.snapshot?.model,
         armed: entry.snapshot === undefined ? false : cfg.requireProvenCache === false || routeState(entry.snapshot.provider, entry.snapshot.model).proven,
@@ -425,12 +607,19 @@ export function apply(ctx) {
         nextDueSeconds: Math.max(0, Math.round((entry.nextDueAt - Date.now()) / 1000))
       })),
       stats: {
-        ...stats,
+        touches: stats.touches,
+        hits: stats.hits,
+        misses: stats.misses,
+        unknown: stats.unknown,
+        errors: stats.errors,
+        cacheRead: stats.cacheRead,
+        input: stats.input,
+        output: stats.output,
         hitRate: stats.touches > 0 ? +(stats.hits / stats.touches).toFixed(3) : null,
-        costEstimate: +cost.toFixed(4),
-        avoidedEstimate: +avoided.toFixed(4)
+        costEstimate: +stats.cost.toFixed(4),
+        savedEstimate: +saved.toFixed(4)
       },
-      recent: recentPublic
+      tasks
     };
   }
 
@@ -500,6 +689,56 @@ export function apply(ctx) {
           }
         }
       });
+      const offTask = webServer.register({
+        kind: 'exact',
+        path: '/plugins/cache-keepalive/task',
+        handler: (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            send(res, 405, { error: 'method not allowed' });
+            return;
+          }
+          let sessionId = '';
+          try {
+            sessionId = new URL(req.url, 'http://127.0.0.1').searchParams.get('session') ?? '';
+          } catch {
+            sessionId = '';
+          }
+          if (sessionId.length === 0) {
+            send(res, 400, { error: 'session required' });
+            return;
+          }
+          const task = buildTasks().find((item) => item.id === sessionId);
+          if (task === undefined) {
+            send(res, 404, { error: 'record not found' });
+            return;
+          }
+          send(res, 200, { task, records: taskRecords(sessionId) });
+        }
+      });
+      const offTaskDelete = webServer.register({
+        kind: 'exact',
+        path: '/plugins/cache-keepalive/task/delete',
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            send(res, 405, { error: 'method not allowed' });
+            return;
+          }
+          try {
+            const body = await readBody(req, 4096);
+            const payload = body.length === 0 ? {} : JSON.parse(body);
+            const sessionId = typeof payload.session === 'string' ? payload.session : '';
+            if (sessionId.length === 0) {
+              send(res, 400, { error: 'session required' });
+              return;
+            }
+            const removed = deleteTask(sessionId);
+            appendLog({ kind: 'record-deleted', session: sessionId, ok: removed });
+            send(res, 200, { ok: removed });
+          } catch (error) {
+            send(res, 400, { error: String(error?.message ?? error) });
+          }
+        }
+      });
       const offDebug = webServer.register({
         kind: 'exact',
         path: '/plugins/cache-keepalive/debug',
@@ -547,6 +786,8 @@ export function apply(ctx) {
         offState();
         offConfig();
         offDiagLog();
+        offTask();
+        offTaskDelete();
         offDebug();
       };
       });
