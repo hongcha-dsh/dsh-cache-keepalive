@@ -17,9 +17,14 @@ API, 10k-token unique prefixes):
 | 45 min | 0% (needs a touch before then) | — |
 
 Replaying with `max_tokens: 16` still hits (verified; `max_tokens: 1` can fail an "empty
-response" check). Cost per touch at a 252k context ≈ ¥0.33; one expired re-prefill ≈ ¥3.28.
-Break-even is **8 touches per idle gap** (`k+1 < 10`). Interval must stay below the measured
-TTL: 20 min for kimi-coding, 4.5 min for huosan.
+response" check). Cost per touch at a 252k context ≈ ¥0.33; one expired re-prefill ≈ ¥3.28 in
+input alone, plus a ¥3.28 5-minute cache write (official billing charges the write too) ≈ ¥6.56
+cold. Break-even is therefore up to ~18 touches per idle gap
+(`C × hit × (20 − k) > 0`); the default `maxTouches: 8` stays deliberately conservative.
+Interval must stay below the measured TTL: 20 min for kimi-coding, 4.5 min for huosan.
+On subscription routes that do not discount cache reads (e.g. Ark Agent Plan `/api/plan`,
+whose AFP formula has no cache term), keep-alive saves nothing and only burns quota —
+leave those routes out of `config.routes`.
 
 ## What the user sees
 
@@ -38,16 +43,18 @@ TTL: 20 min for kimi-coding, 4.5 min for huosan.
 
 ### How "saved" is counted
 
-A warm cache saves exactly one miss worth of prompt tokens; keeping it warm costs one cache read per
-touch. For one idle gap with `k` touches and `C` prompt tokens:
+A cold re-prefill costs the prompt at the input price plus a 5-minute cache write of the same
+tokens (official billing counts both); keeping it warm costs one cache read per touch. For one
+idle gap with `k` touches and `C` prompt tokens:
 
 ```
-net = C × hit_price × (R − k)      R = input_price / hit_price = 10 for Kimi
+net = C × hit_price × (R − k)      R = (input_price + write_5m_price) / hit_price = 20 for kimi-k3.1-pro
 ```
 
 A gap that only produced misses/errors saved nothing and is counted negative. Task rows and the
 top-line "估算净省" both use this net figure, so the number already has the keepalive spend
-subtracted. Prices are kimi-coding list prices (hit ¥1.3 / input ¥13 / output ¥68 per MTok).
+subtracted. Prices are kimi-k3.1-pro list prices (hit ¥1.3 / input ¥13 / output ¥68 / 5m write
+¥13 per MTok).
 
 ## Behaviour
 
@@ -88,7 +95,7 @@ These serve the card. They expose only token counts, task titles and config — 
 | `config.json` | live config, including the per-window `sessionEnabled` map; hot-reloaded every 2 s |
 | `keepalive.jsonl` | append-only log: `start`, `capture`, `keepalive`, `stop`, `config`, `session-switch`, `record-deleted` |
 
-## Limits (v0.5)
+## Limits (v0.5.1)
 
 - **Per window, off by default.** Use the composer pill in each conversation; the Configure page's
   "新会话默认" only sets the fallback for windows that never chose.
@@ -101,3 +108,4 @@ These serve the card. They expose only token counts, task titles and config — 
 - Deleting a record removes its `keepalive` lines from `keepalive.jsonl` and stops the current idle
   gap for that session (it re-arms on the next real request); it does not toggle the keepalive.
 - No UI for adding routes yet; edit `config.json` (hot-reloaded) for `routes` / `routeIntervals`.
+

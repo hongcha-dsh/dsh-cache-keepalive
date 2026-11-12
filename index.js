@@ -126,8 +126,12 @@ export function apply(ctx) {
   const titleCache = new Map();
   /** Browser-side diagnostics reported by client.js (bundle load, slot registration errors). */
   const clientDiagnostics = [];
-  /** CNY per 1M tokens, kimi-coding list price; only used for the estimate labels. */
-  const PRICE = { hit: 1.3, input: 13, output: 68 };
+  /**
+   * CNY per 1M tokens, kimi-k3.1-pro list price (official domestic price page):
+   * input ¥13, hit ¥1.3, output ¥68, cache write (5m TTL) ¥13. Only used for
+   * the estimate labels.
+   */
+  const PRICE = { hit: 1.3, input: 13, output: 68, write: 13 };
 
   function priceOf(record) {
     return ((record.cacheRead ?? 0) * PRICE.hit + (record.input ?? 0) * PRICE.input + (record.output ?? 0) * PRICE.output) / 1e6;
@@ -292,12 +296,14 @@ export function apply(ctx) {
   }
 
   /**
-   * Net saving of one idle gap. Keeping a cache warm saves exactly one miss
-   * (C tokens billed at the input price) and costs `touches` cache reads
-   * (C tokens at the hit price), so net = C * hit * (R - touches), R = input/hit.
-   * A gap whose only outcomes were misses/errors saved nothing and cost cash.
+   * Net saving of one idle gap. A cold re-prefill costs C tokens at the input
+   * price PLUS a C-token 5m cache write (official billing counts both), i.e.
+   * (input + write) per token; keeping the cache warm costs `touches` cache
+   * reads at the hit price. So net = C * hit * (R - touches), R = (input+write)/hit
+   * = 20 for kimi-k3.1-pro. A gap whose only outcomes were misses/errors saved
+   * nothing and cost cash.
    */
-  const PRICE_RATIO = PRICE.input / PRICE.hit;
+  const PRICE_RATIO = (PRICE.input + PRICE.write) / PRICE.hit;
   function summarizeSession(records) {
     const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
     const gaps = [];
