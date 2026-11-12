@@ -129,11 +129,13 @@ window.__ModuleLoader__.load({
         const enabled = pendingEnabled === null ? (state ? state.enabled : false) : pendingEnabled;
         const config = draft || (state && state.config) || {};
         const edit = (key, value) => setDraft({ ...config, [key]: value });
+        const openWindows = state && state.sessions ? state.sessions.filter((s) => s.enabled).length : 0;
 
         return h('div', { style: box, 'data-plugin': 'cache-keepalive' },
           h('div', { style: row },
             h('strong', null, '提示词缓存保活'),
-            h('span', { style: { ...label, opacity: enabled ? 0.65 : 0.45 } }, enabled ? '● 运行中' : '○ 已暂停'),
+            h('span', { style: { ...label, opacity: 0.65 } },
+              (enabled ? '新会话默认开' : '新会话默认关') + (openWindows > 0 ? ' · ' + openWindows + ' 个窗口已单独开启' : '')),
             error ? h('span', { style: { ...label, color: '#c4553b' } }, '状态接口不可用：' + error) : null
           ),
           h('div', { style: grid },
@@ -147,8 +149,9 @@ window.__ModuleLoader__.load({
 
           h('div', { style: card },
             h('div', { style: row },
-              h('span', { style: label }, '启用'),
-              h('button', { style: { ...button, fontWeight: 600, borderColor: 'currentColor' }, disabled: busy || state === null, onClick: () => post({ enabled: !enabled }) }, enabled ? '暂停保活' : '启动保活'),
+              h('span', { style: label }, '新会话默认'),
+              h('button', { style: { ...button, fontWeight: 600, borderColor: 'currentColor' }, disabled: busy || state === null, onClick: () => post({ enabled: !enabled }) }, enabled ? '默认开' : '默认关'),
+              h('span', { style: { ...label, opacity: 0.55 } }, '每个窗口用回复框的「缓存保活」按钮单独开关，互不影响'),
               h('span', { style: label }, '线路：'),
               h('code', { style: { fontSize: 12 } }, config.routes && config.routes.length > 0 ? config.routes.map((r) => r.provider + ' / ' + r.model).join('，') : '跟随当前会话模型')
             ),
@@ -183,7 +186,7 @@ window.__ModuleLoader__.load({
 
           h('div', { style: card },
             h('div', { style: row }, h('span', { style: label }, '当前跟踪的会话'), state && state.sessions && state.sessions.length > 0
-              ? h('span', { style: { fontSize: 12 } }, state.sessions.map((s) => (s.title ? s.title + ' · ' : '') + s.session + ' · ' + (s.provider || '?') + '/' + (s.model || '?') + ' · 空闲 ' + s.idleMinutes + ' 分钟 · 已保活 ' + s.touches + ' 次' + (s.armed ? '' : ' · 待首次命中') + (s.stopped ? ' · 已停' : '')).join('；'))
+              ? h('span', { style: { fontSize: 12 } }, state.sessions.map((s) => (s.title ? s.title + ' · ' : '') + '[' + (s.enabled ? '开' : '关') + '] ' + s.session + ' · ' + (s.provider || '?') + '/' + (s.model || '?') + ' · 空闲 ' + s.idleMinutes + ' 分钟 · 已保活 ' + s.touches + ' 次' + (s.armed ? '' : ' · 待首次命中') + (s.stopped ? ' · 已停' : '')).join('；'))
               : h('span', { style: { fontSize: 12, opacity: 0.55 } }, '暂无（等下一次真实请求）'))
           ),
 
@@ -272,6 +275,7 @@ window.__ModuleLoader__.load({
                 },
                   h('span', { style: { opacity: 0.5, fontSize: 11, width: 10, flex: '0 0 auto' } }, open ? '▾' : '▸'),
                   h('span', { style: { fontWeight: 600, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.title),
+                  h('span', { style: { ...label, whiteSpace: 'nowrap', opacity: 0.55 } }, task.enabled === false ? '窗口关' : '窗口开'),
                   h('span', { style: { ...label, whiteSpace: 'nowrap' } }, tokens(task.touches) + ' 次'),
                   h('span', { style: { ...label, whiteSpace: 'nowrap', opacity: task.saved > 0 ? 0.75 : 0.5 } }, '省 ' + money(task.saved)),
                   h('span', { style: { ...label, whiteSpace: 'nowrap', opacity: 0.45 } }, clockDate(task.lastAt))
@@ -341,28 +345,42 @@ window.__ModuleLoader__.load({
         );
       }
 
-      // One compact start/pause pill beside the message composer, so the
-      // keep-alive can be started or paused without leaving the conversation.
-      function ComposerButton() {
+      // One compact start/pause pill beside the message composer. It controls
+      // ONLY the conversation it renders in: the Host stores a per-session switch,
+      // so toggling one window never changes another.
+      function ComposerButton({ sessionId }) {
         const { state } = useStatus();
         const [busy, setBusy] = React.useState(false);
-        const enabled = state ? state.enabled : null;
+        const [pending, setPending] = React.useState(null);
+        const config = state && state.config ? state.config : null;
+        const explicit = config && config.sessionEnabled && Object.prototype.hasOwnProperty.call(config.sessionEnabled, sessionId)
+          ? config.sessionEnabled[sessionId] === true
+          : null;
+        const stored = config === null ? null : explicit === null ? config.enabled === true : explicit;
+        const enabled = pending === null ? stored : pending;
+        React.useEffect(() => {
+          if (pending !== null && stored === pending) setPending(null);
+        }, [pending, stored]);
         const toggle = async () => {
-          if (enabled === null) return;
+          if (enabled === null || busy || typeof sessionId !== 'string' || sessionId.length === 0) return;
+          const next = !enabled;
+          setPending(next);
           setBusy(true);
           try {
-            const res = await fetch(API + '/config', {
+            const res = await fetch(API + '/session', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ enabled: !enabled })
+              body: JSON.stringify({ session: sessionId, enabled: next })
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
           } catch {
-            /* the configuration card shows the error text */
+            setPending(null);
           } finally {
             setBusy(false);
           }
         };
+        if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
+        const interval = (config && config.intervalMinutes) || 20;
         const dot = enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
         return h('button', {
           type: 'button',
@@ -370,9 +388,9 @@ window.__ModuleLoader__.load({
           title: enabled === null
             ? '提示词缓存保活：状态读取中'
             : enabled
-              ? '提示词缓存保活：运行中（每 ' + ((state && state.config && state.config.intervalMinutes) || 20) + ' 分钟续一次缓存），点击暂停'
-              : '提示词缓存保活：已暂停，点击启动',
-          'aria-label': '提示词缓存保活开关',
+              ? '提示词缓存保活：本窗口已开启（空闲时每 ' + interval + ' 分钟续一次缓存），点击只关闭本窗口'
+              : '提示词缓存保活：本窗口已关闭，点击只开启本窗口',
+          'aria-label': '提示词缓存保活开关（仅本会话）',
           disabled: busy || enabled === null,
           onClick: toggle,
           style: {
@@ -394,7 +412,7 @@ window.__ModuleLoader__.load({
         },
           h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: dot, display: 'inline-block' } }),
           h('span', null, '缓存保活'),
-          h('span', { style: { opacity: 0.65 } }, enabled === null ? '读取中' : enabled ? '开' : '关')
+          h('span', { style: { opacity: 0.65 } }, enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
         );
       }
 
@@ -423,7 +441,17 @@ window.__ModuleLoader__.load({
               try {
                 report('composer-slot-inject');
                 return ctx.slots.register(
-                  { name: 'conversation.composer.dock', id: 'cache-keepalive-toggle', order: 30 },
+                  {
+                    name: 'conversation.composer.dock',
+                    id: 'cache-keepalive-toggle',
+                    order: 30,
+                    // Session-scoped slot: the renderer passes this slot's binding
+                    // key (the session id) as the first inject argument.
+                    inject: (sessionId) => {
+                      report('composer-inject', sessionId === undefined ? 'missing' : String(sessionId).slice(0, 12));
+                      return { sessionId };
+                    }
+                  },
                   ComposerButton
                 );
               } catch (error) {

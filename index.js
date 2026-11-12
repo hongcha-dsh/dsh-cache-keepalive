@@ -29,7 +29,10 @@ const CONFIG_PATH = PLUGIN_DIR + 'config.json';
 const LOG_PATH = PLUGIN_DIR + 'keepalive.jsonl';
 
 const DEFAULTS = {
+  /** Default for a session that never chose explicitly (per-window switches win). */
   enabled: false,
+  /** sessionId -> boolean: the per-conversation switch owned by the composer pill. */
+  sessionEnabled: {},
   intervalMinutes: 20,
   maxIdleMinutes: 150,
   maxTouches: 8,
@@ -57,6 +60,13 @@ function normalizeConfig(raw) {
     }
   }
   cfg.routeIntervals = intervals;
+  const perSession = {};
+  if (cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' && !Array.isArray(cfg.sessionEnabled)) {
+    for (const [sessionId, value] of Object.entries(cfg.sessionEnabled)) {
+      if (typeof sessionId === 'string' && sessionId.length > 0 && typeof value === 'boolean') perSession[sessionId] = value;
+    }
+  }
+  cfg.sessionEnabled = perSession;
   cfg.requireProvenCache = cfg.requireProvenCache !== false;
   if (!Number.isFinite(cfg.intervalMinutes) || cfg.intervalMinutes <= 0) cfg.intervalMinutes = DEFAULTS.intervalMinutes;
   if (!Number.isFinite(cfg.maxIdleMinutes) || cfg.maxIdleMinutes <= 0) cfg.maxIdleMinutes = DEFAULTS.maxIdleMinutes;
@@ -259,6 +269,22 @@ export function apply(ctx) {
     return routes.some((route) => route.provider === provider && route.model === model);
   }
 
+  /** Per-window switch: explicit session choice wins over the config default. */
+  function sessionEnabledOf(sessionId) {
+    const map = cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' ? cfg.sessionEnabled : {};
+    if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
+    return cfg.enabled === true;
+  }
+  function setSessionEnabledOf(sessionId, enabled) {
+    const map = { ...(cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' ? cfg.sessionEnabled : {}) };
+    map[sessionId] = enabled === true;
+    const keys = Object.keys(map);
+    for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
+    cfg = saveConfig({ ...cfg, sessionEnabled: map });
+    if (enabled !== true) sessions.delete(sessionId);
+    appendLog({ kind: 'session-switch', session: sessionId, enabled: enabled === true });
+  }
+
   function prune() {
     if (sessions.size <= cfg.maxSessions) return;
     const newestFirst = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt);
@@ -334,6 +360,7 @@ export function apply(ctx) {
       tasks.push({
         id: sessionId,
         title: title.length > 0 ? title : '会话 ' + sessionId.replace(/^session-/, '').slice(0, 8),
+        enabled: sessionEnabledOf(sessionId),
         provider: latest?.provider ?? null,
         model: latest?.model ?? null,
         firstAt: records[0]?.ts ?? null,
@@ -396,12 +423,16 @@ export function apply(ctx) {
   }
 
   function capture(options) {
-    if (!cfg.enabled) return;
     if (options === null || typeof options !== 'object') return;
     if (replaying.has(options)) return;
     if (options.purpose !== undefined) return;
     const sessionId = options.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+    if (!sessionEnabledOf(sessionId)) {
+      // This window is switched off: forget its snapshot so nothing gets replayed.
+      sessions.delete(sessionId);
+      return;
+    }
     if (!routeAllowed(options.provider, options.model)) return;
     if (isNotUserVisibleMainSession(sessionId)) return;
 
@@ -466,6 +497,11 @@ export function apply(ctx) {
   }
 
   async function replay(sessionId, entry) {
+    if (!sessionEnabledOf(sessionId)) {
+      entry.stopped = true;
+      sessions.delete(sessionId);
+      return;
+    }
     if (busy) return;
     if (entry.stopped) return;
     if (entry.touches >= cfg.maxTouches) {
@@ -544,9 +580,13 @@ export function apply(ctx) {
   }
 
   function tick() {
-    if (!cfg.enabled) return;
+    if (sessions.size === 0) return;
     const entries = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt).slice(0, cfg.maxSessions);
     for (const [sessionId, entry] of entries) {
+      if (!sessionEnabledOf(sessionId)) {
+        sessions.delete(sessionId);
+        continue;
+      }
       void replay(sessionId, entry).catch((error) => {
         ctx.logger?.warn?.('cache-keepalive: replay failed: ' + String(error?.message ?? error));
       });
@@ -556,12 +596,10 @@ export function apply(ctx) {
 
   ctx.on('llm/stream', (options, next) => {
     const raw = next();
-    if (cfg.enabled) {
-      try {
-        capture(options);
-      } catch (error) {
-        ctx.logger?.warn?.('cache-keepalive: capture failed: ' + String(error?.message ?? error));
-      }
+    try {
+      capture(options);
+    } catch (error) {
+      ctx.logger?.warn?.('cache-keepalive: capture failed: ' + String(error?.message ?? error));
     }
     const sessionId = options?.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return raw;
@@ -575,8 +613,11 @@ export function apply(ctx) {
     return {
       now: Date.now(),
       startedAt,
+      /** Default for sessions that never chose explicitly. */
       enabled: cfg.enabled,
       config: {
+        enabled: cfg.enabled,
+        sessionEnabled: cfg.sessionEnabled,
         intervalMinutes: cfg.intervalMinutes,
         maxIdleMinutes: cfg.maxIdleMinutes,
         maxTouches: cfg.maxTouches,
@@ -596,8 +637,10 @@ export function apply(ctx) {
         intervalMinutes: +(intervalFor(route.provider, route.model) / 60000).toFixed(1)
       })),
       sessions: [...sessions.entries()].map(([sessionId, entry]) => ({
+        id: sessionId,
         session: String(sessionId).slice(0, 18),
         title: entry.title ?? sessionTitle(sessionId) ?? null,
+        enabled: sessionEnabledOf(sessionId),
         provider: entry.snapshot?.provider,
         model: entry.snapshot?.model,
         armed: entry.snapshot === undefined ? false : cfg.requireProvenCache === false || routeState(entry.snapshot.provider, entry.snapshot.model).proven,
@@ -665,6 +708,33 @@ export function apply(ctx) {
             cfg = saveConfig({ ...cfg, ...patch });
             appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
             send(res, 200, { ok: true, config: cfg });
+          } catch (error) {
+            send(res, 400, { error: String(error?.message ?? error) });
+          }
+        }
+      });
+      const offSession = webServer.register({
+        kind: 'exact',
+        path: '/plugins/cache-keepalive/session',
+        handler: async (req, res) => {
+          if (req.method !== 'POST') {
+            send(res, 405, { error: 'method not allowed' });
+            return;
+          }
+          try {
+            const body = await readBody(req, 4096);
+            const payload = body.length === 0 ? {} : JSON.parse(body);
+            const sessionId = typeof payload.session === 'string' ? payload.session : '';
+            if (sessionId.length === 0) {
+              send(res, 400, { error: 'session required' });
+              return;
+            }
+            if (typeof payload.enabled !== 'boolean') {
+              send(res, 400, { error: 'enabled must be a boolean' });
+              return;
+            }
+            setSessionEnabledOf(sessionId, payload.enabled);
+            send(res, 200, { ok: true, session: sessionId, enabled: sessionEnabledOf(sessionId) });
           } catch (error) {
             send(res, 400, { error: String(error?.message ?? error) });
           }
@@ -785,6 +855,7 @@ export function apply(ctx) {
       yield () => {
         offState();
         offConfig();
+        offSession();
         offDiagLog();
         offTask();
         offTaskDelete();

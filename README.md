@@ -25,11 +25,14 @@ TTL: 20 min for kimi-coding, 4.5 min for huosan.
 
 - **Settings → Plugins**: one row, "Prompt cache keep-alive" / "提示词缓存保活", with an icon.
 - The row has a **Configure** page (the card): live status, counters, editable interval / idle
-  cap / touch cap / replay output cap, and a per-task record list.
+  cap / touch cap / replay output cap, the per-session default, and a per-task record list.
+- **Composer pill** (`[● 缓存保活 本窗口开/关]`): switches keep-alive for **that conversation only**.
+  Each window keeps its own switch; toggling one never changes another. The pill reads/writes
+  `config.sessionEnabled[<sessionId>]` through `POST /plugins/cache-keepalive/session`.
 - **Record list**: one record per task (= one conversation), named by the conversation title.
-  Each row shows how many keepalives ran and the net yuan saved; click it to expand the per-touch
-  detail (time, cache-read / uncached / output tokens, cost, latency) and click 删除 to drop that
-  record.
+  Each row shows how many keepalives ran, whether that window is on, and the net yuan saved; click
+  it to expand the per-touch detail (time, cache-read / uncached / output tokens, cost, latency)
+  and click 删除 to drop that record.
 - **Chat**: nothing. No message, no badge, no tool call.
 - Everything else: `keepalive.jsonl` (append-only).
 
@@ -48,6 +51,9 @@ subtracted. Prices are kimi-coding list prices (hit ¥1.3 / input ¥13 / output 
 
 ## Behaviour
 
+- **Per-window switch.** `config.sessionEnabled[<sessionId>]` is the authoritative choice for that
+  conversation; `config.enabled` is only the default used by a session that never chose explicitly.
+  A disabled window captures nothing and replays nothing; enabling arms on the next real request.
 - **Follows the session's model.** It captures the latest real `llm/stream` request per session and
   replays with that request's own provider/model. `config.routes: []` means "any route"; fill it to
   restrict. Per-route pacing lives in `config.routeIntervals` (kimi-coding 20 min, huosan 5 min),
@@ -67,8 +73,9 @@ subtracted. Prices are kimi-coding list prices (hit ¥1.3 / input ¥13 / output 
 
 | method + path | purpose |
 |---|---|
-| `GET /plugins/cache-keepalive/state` | config, counters, tracked sessions, per-task records |
-| `POST /plugins/cache-keepalive/config` | merge a JSON patch into `config.json` and apply it |
+| `GET /plugins/cache-keepalive/state` | config, counters, tracked sessions (with their switch), per-task records |
+| `POST /plugins/cache-keepalive/config` | merge a JSON patch into `config.json` and apply it (`enabled` = default) |
+| `POST /plugins/cache-keepalive/session` | `{"session":"<id>","enabled":true\|false}`: one window's switch |
 | `GET /plugins/cache-keepalive/task?session=<id>` | one task record plus its per-touch detail |
 | `POST /plugins/cache-keepalive/task/delete` | `{"session":"<id>"}`: forget that task record |
 
@@ -78,12 +85,15 @@ These serve the card. They expose only token counts, task titles and config — 
 
 | file | purpose |
 |---|---|
-| `config.json` | live config (also editable in the card); hot-reloaded every 2 s |
-| `keepalive.jsonl` | append-only log: `start`, `capture`, `keepalive`, `stop`, `config`, `record-deleted` |
+| `config.json` | live config, including the per-window `sessionEnabled` map; hot-reloaded every 2 s |
+| `keepalive.jsonl` | append-only log: `start`, `capture`, `keepalive`, `stop`, `config`, `session-switch`, `record-deleted` |
 
-## Limits (v0.4)
+## Limits (v0.5)
 
-- **Off by default.** Start or pause from the composer pill (`[● 缓存保活 开]`) or the Configure page.
+- **Per window, off by default.** Use the composer pill in each conversation; the Configure page's
+  "新会话默认" only sets the fallback for windows that never chose.
+- Turning a window on while it is idle arms it on the next real request (no snapshot is kept while
+  it is off).
 - Request snapshots stay in memory; a DSH restart re-arms on the next real request.
 - The card's yuan figures are estimates at kimi-coding list prices, not a bill.
 - Task names come from the session title; a session without a generated title yet falls back to

@@ -1,12 +1,18 @@
 {
-  "enabled": true,
+  "enabled": false,
+  "sessionEnabled": {},
   "intervalMinutes": 20,
   "maxIdleMinutes": 150,
   "maxTouches": 8,
-  "replayMaxTokens": 1,
+  "replayMaxTokens": 16,
   "scanSeconds": 30,
   "maxSessions": 1,
   "routes": [
     { "provider": "kimi-coding", "model": "kimi-k3.1-pro" }
-  ]
+  ],
+  "routeIntervals": {
+    "kimi-coding/kimi-k3.1-pro": 20,
+    "huosan/kimi-k3.1-pro": 5
+  },
+  "requireProvenCache": true
 }
