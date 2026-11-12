@@ -379,19 +379,21 @@ window.__ModuleLoader__.load({
             setBusy(false);
           }
         };
-        if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
+        const missing = typeof sessionId !== 'string' || sessionId.length === 0;
         const interval = (config && config.intervalMinutes) || 20;
-        const dot = enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
+        const dot = missing || enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
         return h('button', {
           type: 'button',
           'data-plugin': 'cache-keepalive-toggle',
-          title: enabled === null
-            ? '提示词缓存保活：状态读取中'
-            : enabled
-              ? '提示词缓存保活：本窗口已开启（空闲时每 ' + interval + ' 分钟续一次缓存），点击只关闭本窗口'
-              : '提示词缓存保活：本窗口已关闭，点击只开启本窗口',
+          title: missing
+            ? '提示词缓存保活：没拿到本窗口的会话 id'
+            : enabled === null
+              ? '提示词缓存保活：状态读取中'
+              : enabled
+                ? '提示词缓存保活：本窗口已开启（空闲时每 ' + interval + ' 分钟续一次缓存），点击只关闭本窗口'
+                : '提示词缓存保活：本窗口已关闭，点击只开启本窗口',
           'aria-label': '提示词缓存保活开关（仅本会话）',
-          disabled: busy || enabled === null,
+          disabled: missing || busy || enabled === null,
           onClick: toggle,
           style: {
             display: 'inline-flex',
@@ -403,16 +405,16 @@ window.__ModuleLoader__.load({
             background: 'transparent',
             border: '1px solid rgba(127,127,127,0.35)',
             borderRadius: 999,
-            cursor: busy ? 'default' : 'pointer',
+            cursor: missing || busy ? 'default' : 'pointer',
             font: 'inherit',
             fontSize: 12,
             lineHeight: 1.4,
-            opacity: busy ? 0.6 : 1
+            opacity: missing || busy ? 0.6 : 1
           }
         },
           h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: dot, display: 'inline-block' } }),
           h('span', null, '缓存保活'),
-          h('span', { style: { opacity: 0.65 } }, enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
+          h('span', { style: { opacity: 0.65 } }, missing ? '未识别' : enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
         );
       }
 
