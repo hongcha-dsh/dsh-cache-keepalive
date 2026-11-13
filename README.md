@@ -1,5 +1,22 @@
 # dsh-cache-keepalive
 
+## 中文说明
+
+主会话空闲时自动重放最近一次请求（同 provider / model / messages / tools / toolHistory，只把 `maxTokens` 压低），
+让上游的 prompt cache 不过期：下一次真实请求按**缓存命中价**计费，而不是按冷启动的输入价 + 5 分钟缓存写入价重算一遍。
+重放不写会话、不进聊天、不执行工具。
+
+- **装法**：DSH 里打开「插件」页 →「插件市场」，搜索「缓存保活」一键安装；或
+  `dsh plugin --profile <profile> add github:hongcha-dsh/dsh-cache-keepalive`。
+- **开关**：每个对话窗口的输入框旁各有一个「缓存保活」按钮，只控制**当前窗口**，互不影响；默认关闭。
+- **记录**：设置 → 插件 → 本插件 →「配置」，按任务（会话标题）各记一条，点开看每次保活明细与估算净省，可删除。
+- **只在有缓存折扣的线路上有意义**：Kimi 这类缓存读取按 1/10 计费的线路能省；Ark Agent Plan `/api/plan`
+  这种公式里没有缓存项的订阅线路，保活只会烧配额，请从 `config.routes` 里排除。
+
+下面英文部分是完整设计说明（原理、计费公式、HTTP 接口、限制）。
+
+## English overview
+
 Host-only Harness bundle + a settings-page card. While a user-visible main session is idle, it
 replays the last real model request (same provider/model/messages/tools/toolHistory/config, only
 `maxTokens` lowered) through `ctx.llm.stream()`, so the provider prompt cache stays warm and the
@@ -95,7 +112,7 @@ These serve the card. They expose only token counts, task titles and config — 
 | `config.json` | live config, including the per-window `sessionEnabled` map; hot-reloaded every 2 s |
 | `keepalive.jsonl` | append-only log: `start`, `capture`, `keepalive`, `stop`, `config`, `session-switch`, `record-deleted` |
 
-## Limits (v0.5.1)
+## Limits (v0.5.2)
 
 - **Per window, off by default.** Use the composer pill in each conversation; the Configure page's
   "新会话默认" only sets the fallback for windows that never chose.
