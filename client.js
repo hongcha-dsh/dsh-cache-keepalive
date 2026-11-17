@@ -345,6 +345,95 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // The composer pill's hover card lives in a portal on <body>: the dock clips
+      // its own overflow, so an absolutely-positioned child would be cut off.
+      let ReactDOM;
+      try {
+        ReactDOM = require('react-dom');
+      } catch {
+        ReactDOM = undefined;
+      }
+      const canFloat = typeof document !== 'undefined' && ReactDOM !== undefined && ReactDOM !== null && typeof ReactDOM.createPortal === 'function';
+
+      // Theme tokens with fallbacks: a renamed token changes the look, never breaks the card.
+      const TIP = {
+        label: 'var(--dsw-alias-label-primary, #101828)',
+        secondary: 'var(--dsw-alias-label-secondary, #4a5565)',
+        tertiary: 'var(--dsw-alias-label-tertiary, #667085)',
+        border: 'var(--dsw-alias-border-l2, rgba(127,127,127,0.28))',
+        bg: 'var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-base, #ffffff)))',
+        shadow: 'var(--dsw-elevation-prominent, 0 12px 32px rgba(16,24,40,0.18))',
+        radius: 'var(--dsw-radius-lg, 12px)'
+      };
+
+      /**
+       * Hover card for one window's keepalive. All numbers come from
+       * /state → windows[<sessionId>], which the Host scopes to "since this
+       * window was switched on" (it restarts whenever the pill is turned on).
+       */
+      function WindowTip({ rect, enabled, win, interval, onEnter, onLeave }) {
+        const frame = {
+          position: 'fixed',
+          zIndex: 2147483000,
+          width: 248,
+          boxSizing: 'border-box',
+          padding: '10px 12px',
+          borderRadius: TIP.radius,
+          border: '1px solid ' + TIP.border,
+          background: TIP.bg,
+          color: TIP.label,
+          boxShadow: TIP.shadow,
+          fontSize: 12,
+          lineHeight: 1.55
+        };
+        // Above the pill normally; below it when the composer sits high on screen.
+        if (rect) {
+          frame.left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - 256));
+          if (rect.top > 210) frame.bottom = Math.max(8, window.innerHeight - rect.top + 8);
+          else frame.top = Math.min(window.innerHeight - 16, rect.bottom + 8);
+        }
+        const row = (name, value) => h('div', { style: { display: 'flex', gap: 10, justifyContent: 'space-between', alignItems: 'baseline' } },
+          h('span', { style: { color: TIP.tertiary, whiteSpace: 'nowrap' } }, name),
+          h('span', { style: { textAlign: 'right', fontWeight: 500 } }, value)
+        );
+        const touches = win && typeof win.touches === 'number' ? win.touches : 0;
+        // Off renders no body at all: just the header and the "click to turn on" footer.
+        const body = enabled === null
+          ? h('div', { style: { color: TIP.secondary, lineHeight: 1.6 } }, '正在读取本窗口状态…')
+          : enabled
+            ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 1 } },
+              row('本次开启', '保活 ' + tokens(touches) + ' 次'),
+              row('花费', money(win ? win.cost : 0)),
+              row('命中 / 次数', tokens(win ? win.hits : 0) + ' / ' + tokens(win ? win.touches : 0)),
+              row('缓存读取', tokens(win ? win.cacheRead : 0)),
+              row('净省', money(win ? win.saved : 0)),
+              win && win.gapTouches > 0 ? row('本轮空闲', '已保活 ' + tokens(win.gapTouches) + ' 次') : null,
+              row('最近一次', win && win.lastAt ? clock(win.lastAt) : '还没开始'),
+              win && win.stopped ? row('状态', '本轮已停，等下一次真实请求') : null
+            )
+            : null;
+
+        return ReactDOM.createPortal(
+          h('div', {
+            'data-plugin': 'cache-keepalive-tip',
+            role: 'tooltip',
+            style: frame,
+            onMouseEnter: onEnter,
+            onMouseLeave: onLeave
+          },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 } },
+              h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: enabled === true ? '#3fbf6f' : 'rgba(127,127,127,0.55)', display: 'inline-block' } }),
+              h('strong', { style: { fontSize: 12 } }, '提示词缓存保活'),
+              h('span', { style: { color: TIP.tertiary } }, enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
+            ),
+            body,
+            h('div', { style: { marginTop: 7, paddingTop: 6, borderTop: '1px solid ' + TIP.border, color: TIP.tertiary } },
+              enabled === null ? '状态读取中' : enabled ? '点击关闭本窗口 · 空闲时每 ' + interval + ' 分钟续一次' : '点击开启本窗口')
+          ),
+          document.body
+        );
+      }
+
       // One compact start/pause pill beside the message composer. It controls
       // ONLY the conversation it renders in: the Host stores a per-session switch,
       // so toggling one window never changes another.
@@ -352,6 +441,9 @@ window.__ModuleLoader__.load({
         const { state } = useStatus();
         const [busy, setBusy] = React.useState(false);
         const [pending, setPending] = React.useState(null);
+        const [tip, setTip] = React.useState(null);
+        const buttonRef = React.useRef(null);
+        const hideTimer = React.useRef(null);
         const config = state && state.config ? state.config : null;
         const explicit = config && config.sessionEnabled && Object.prototype.hasOwnProperty.call(config.sessionEnabled, sessionId)
           ? config.sessionEnabled[sessionId] === true
@@ -361,6 +453,37 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (pending !== null && stored === pending) setPending(null);
         }, [pending, stored]);
+        // The card must survive the pointer travelling from the pill onto it.
+        React.useEffect(() => () => {
+          if (hideTimer.current !== null) clearTimeout(hideTimer.current);
+        }, []);
+        React.useEffect(() => {
+          if (tip === null) return undefined;
+          const close = () => setTip(null);
+          window.addEventListener('resize', close);
+          return () => window.removeEventListener('resize', close);
+        }, [tip]);
+        const openTip = () => {
+          if (hideTimer.current !== null) {
+            clearTimeout(hideTimer.current);
+            hideTimer.current = null;
+          }
+          const node = buttonRef.current;
+          let rect = null;
+          try {
+            rect = node && typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
+          } catch {
+            rect = null;
+          }
+          setTip({ rect });
+        };
+        const closeTip = () => {
+          if (hideTimer.current !== null) clearTimeout(hideTimer.current);
+          hideTimer.current = setTimeout(() => {
+            hideTimer.current = null;
+            setTip(null);
+          }, 120);
+        };
         const toggle = async () => {
           if (enabled === null || busy || typeof sessionId !== 'string' || sessionId.length === 0) return;
           const next = !enabled;
@@ -382,16 +505,21 @@ window.__ModuleLoader__.load({
         const missing = typeof sessionId !== 'string' || sessionId.length === 0;
         const interval = (config && config.intervalMinutes) || 20;
         const dot = missing || enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
-        return h('button', {
+        const pill = h('button', {
+          ref: buttonRef,
           type: 'button',
           'data-plugin': 'cache-keepalive-toggle',
-          title: missing
-            ? '提示词缓存保活：没拿到本窗口的会话 id'
-            : enabled === null
-              ? '提示词缓存保活：状态读取中'
-              : enabled
-                ? '提示词缓存保活：本窗口已开启（空闲时每 ' + interval + ' 分钟续一次缓存），点击只关闭本窗口'
-                : '提示词缓存保活：本窗口已关闭，点击只开启本窗口',
+          // The native tooltip is only the fallback: with react-dom available the
+          // hover card below replaces it (it shows live numbers, not just a hint).
+          title: canFloat && !missing
+            ? undefined
+            : missing
+              ? '提示词缓存保活：没拿到本窗口的会话 id'
+              : enabled === null
+                ? '提示词缓存保活：状态读取中'
+                : enabled
+                  ? '提示词缓存保活：本窗口已开启（空闲时每 ' + interval + ' 分钟续一次缓存），点击只关闭本窗口'
+                  : '提示词缓存保活：本窗口已关闭，点击只开启本窗口',
           'aria-label': '提示词缓存保活开关（仅本会话）',
           disabled: missing || busy || enabled === null,
           onClick: toggle,
@@ -415,6 +543,25 @@ window.__ModuleLoader__.load({
           h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: dot, display: 'inline-block' } }),
           h('span', null, '缓存保活'),
           h('span', { style: { opacity: 0.65 } }, missing ? '未识别' : enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
+        );
+
+        if (!canFloat || missing) return pill;
+        return h('span', {
+          style: { display: 'inline-flex', alignItems: 'center' },
+          onMouseEnter: openTip,
+          onMouseLeave: closeTip,
+          onFocus: openTip,
+          onBlur: closeTip
+        },
+          pill,
+          tip === null ? null : h(WindowTip, {
+            rect: tip.rect,
+            enabled: enabled === null ? null : enabled === true,
+            win: state && state.windows ? state.windows[sessionId] : null,
+            interval,
+            onEnter: openTip,
+            onLeave: closeTip
+          })
         );
       }
 

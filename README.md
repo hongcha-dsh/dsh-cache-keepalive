@@ -1,22 +1,5 @@
 # dsh-cache-keepalive
 
-## 中文说明
-
-主会话空闲时自动重放最近一次请求（同 provider / model / messages / tools / toolHistory，只把 `maxTokens` 压低），
-让上游的 prompt cache 不过期：下一次真实请求按**缓存命中价**计费，而不是按冷启动的输入价 + 5 分钟缓存写入价重算一遍。
-重放不写会话、不进聊天、不执行工具。
-
-- **装法**：DSH 里打开「插件」页 →「插件市场」，搜索「缓存保活」一键安装；或
-  `dsh plugin --profile <profile> add github:hongcha-dsh/dsh-cache-keepalive`。
-- **开关**：每个对话窗口的输入框旁各有一个「缓存保活」按钮，只控制**当前窗口**，互不影响；默认关闭。
-- **记录**：设置 → 插件 → 本插件 →「配置」，按任务（会话标题）各记一条，点开看每次保活明细与估算净省，可删除。
-- **只在有缓存折扣的线路上有意义**：Kimi 这类缓存读取按 1/10 计费的线路能省；Ark Agent Plan `/api/plan`
-  这种公式里没有缓存项的订阅线路，保活只会烧配额，请从 `config.routes` 里排除。
-
-下面英文部分是完整设计说明（原理、计费公式、HTTP 接口、限制）。
-
-## English overview
-
 Host-only Harness bundle + a settings-page card. While a user-visible main session is idle, it
 replays the last real model request (same provider/model/messages/tools/toolHistory/config, only
 `maxTokens` lowered) through `ctx.llm.stream()`, so the provider prompt cache stays warm and the
@@ -51,6 +34,11 @@ leave those routes out of `config.routes`.
 - **Composer pill** (`[● 缓存保活 本窗口开/关]`): switches keep-alive for **that conversation only**.
   Each window keeps its own switch; toggling one never changes another. The pill reads/writes
   `config.sessionEnabled[<sessionId>]` through `POST /plugins/cache-keepalive/session`.
+- **Hovering the pill** opens a small card with **this window's numbers since it was switched on**:
+  keepalive count, yuan spent, hits / touches, cache-read tokens, net saving, touches in the current
+  idle gap, and the last touch time. The counters restart the moment you turn that window on again
+  (a window that never switched explicitly counts from the plugin start). Turning a window off
+  clears the "本次开启" view; the all-time figures stay on the Configure page.
 - **Record list**: one record per task (= one conversation), named by the conversation title.
   Each row shows how many keepalives ran, whether that window is on, and the net yuan saved; click
   it to expand the per-touch detail (time, cache-read / uncached / output tokens, cost, latency)
@@ -97,7 +85,7 @@ subtracted. Prices are kimi-k3.1-pro list prices (hit ¥1.3 / input ¥13 / outpu
 
 | method + path | purpose |
 |---|---|
-| `GET /plugins/cache-keepalive/state` | config, counters, tracked sessions (with their switch), per-task records |
+| `GET /plugins/cache-keepalive/state` | config, counters, tracked sessions (with their switch), per-task records, and `windows` (numbers since that window was switched on; only windows that are currently on are listed) |
 | `POST /plugins/cache-keepalive/config` | merge a JSON patch into `config.json` and apply it (`enabled` = default) |
 | `POST /plugins/cache-keepalive/session` | `{"session":"<id>","enabled":true\|false}`: one window's switch |
 | `GET /plugins/cache-keepalive/task?session=<id>` | one task record plus its per-touch detail |
@@ -112,7 +100,7 @@ These serve the card. They expose only token counts, task titles and config — 
 | `config.json` | live config, including the per-window `sessionEnabled` map; hot-reloaded every 2 s |
 | `keepalive.jsonl` | append-only log: `start`, `capture`, `keepalive`, `stop`, `config`, `session-switch`, `record-deleted` |
 
-## Limits (v0.5.2)
+## Limits (v0.6.1)
 
 - **Per window, off by default.** Use the composer pill in each conversation; the Configure page's
   "新会话默认" only sets the fallback for windows that never chose.
@@ -125,4 +113,9 @@ These serve the card. They expose only token counts, task titles and config — 
 - Deleting a record removes its `keepalive` lines from `keepalive.jsonl` and stops the current idle
   gap for that session (it re-arms on the next real request); it does not toggle the keepalive.
 - No UI for adding routes yet; edit `config.json` (hot-reloaded) for `routes` / `routeIntervals`.
+- The hover card's "本次开启" epoch survives a Host reload (it is rebuilt from the
+  `session-switch` lines in `keepalive.jsonl`); a window that inherits the config default without
+  ever switching explicitly counts from the plugin start instead.
+- A `session-switch: true` line whose session is no longer enabled reports nothing: an epoch only
+  exists for a window that is currently on (v0.6.1).
 

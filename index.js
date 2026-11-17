@@ -120,6 +120,12 @@ export function apply(ctx) {
   const HISTORY_MAX = 5000;
   const EMPTY_STATS = { touches: 0, hits: 0, misses: 0, unknown: 0, errors: 0, cacheRead: 0, input: 0, output: 0, cost: 0 };
   const stats = { ...EMPTY_STATS };
+  /**
+   * sessionId -> epoch ms of the last time that window's keepalive was switched
+   * on. Rebuilt from the `session-switch` log lines on load, so "本次开启" keeps
+   * the same meaning across a Host reload.
+   */
+  const enabledSince = new Map();
   /** sessionId -> last title seen in the log file (sessions no longer in memory). */
   const storedTitles = new Map();
   /** sessionId -> { title, scannedSeq }: incremental reader of `session/title` events. */
@@ -166,7 +172,18 @@ export function apply(ctx) {
         } catch {
           continue;
         }
-        if (record === null || record.kind !== 'keepalive') continue;
+        if (record === null || typeof record !== 'object') continue;
+        if (record.kind === 'session-switch') {
+          // The switch log is the only durable trace of when a window went on,
+          // so the tooltip's "本次开启" survives a Host reload.
+          const at = Date.parse(record.ts);
+          if (typeof record.session === 'string' && record.session.length > 0 && Number.isFinite(at)) {
+            if (record.enabled === true) enabledSince.set(record.session, at);
+            else enabledSince.delete(record.session);
+          }
+          continue;
+        }
+        if (record.kind !== 'keepalive') continue;
         remember(record);
         if (typeof record.session === 'string' && typeof record.title === 'string' && record.title.length > 0) {
           storedTitles.set(record.session, record.title);
@@ -285,6 +302,9 @@ export function apply(ctx) {
     const keys = Object.keys(map);
     for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
     cfg = saveConfig({ ...cfg, sessionEnabled: map });
+    // Turning a window on starts a fresh "本次开启" epoch; turning it off drops it.
+    if (enabled === true) enabledSince.set(sessionId, Date.now());
+    else enabledSince.delete(sessionId);
     if (enabled !== true) sessions.delete(sessionId);
     appendLog({ kind: 'session-switch', session: sessionId, enabled: enabled === true });
   }
@@ -342,6 +362,70 @@ export function apply(ctx) {
     summary.cost = +summary.cost.toFixed(6);
     summary.saved = +summary.saved.toFixed(6);
     return summary;
+  }
+
+  /**
+   * Epoch of the current "本次开启" for one window: the last time its switch went
+   * on. A window that never switched explicitly but inherits the config default
+   * counts from the moment this plugin started keeping it alive.
+   */
+  function epochSinceOf(sessionId) {
+    // A window that is off has no epoch at all: nothing can be "since it was
+    // switched on". Without this gate a stale `session-switch` line in the log
+    // (the window was switched on once, the config no longer knows it) would
+    // report an epoch for a window that is closed.
+    if (!sessionEnabledOf(sessionId)) return null;
+    const explicit = enabledSince.get(sessionId);
+    if (explicit !== undefined) return explicit;
+    return startedAt;
+  }
+
+  /**
+   * Per-window numbers since that window was switched on — what the composer
+   * pill shows on hover. Turning the window on again resets them, so "本次开启"
+   * is literally this enablement, not the whole history.
+   */
+  function buildWindows() {
+    const ids = new Set([...enabledSince.keys(), ...sessions.keys()]);
+    const buckets = new Map();
+    for (const record of history) {
+      const sessionId = record.session;
+      if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+      ids.add(sessionId);
+      let bucket = buckets.get(sessionId);
+      if (bucket === undefined) {
+        bucket = [];
+        buckets.set(sessionId, bucket);
+      }
+      bucket.push(record);
+    }
+    const windows = {};
+    for (const sessionId of ids) {
+      const enabled = sessionEnabledOf(sessionId);
+      // Only windows that are actually being kept alive right now: a closed
+      // window has nothing to report, and the pill shows its own "off" card.
+      if (!enabled) continue;
+      const since = epochSinceOf(sessionId);
+      const all = buckets.get(sessionId) ?? [];
+      const kept = since === null
+        ? []
+        : all.filter((record) => {
+          const at = Date.parse(record.ts);
+          return Number.isFinite(at) && at >= since;
+        });
+      const entry = sessions.get(sessionId);
+      windows[sessionId] = {
+        enabled,
+        since: since === null ? null : since,
+        ...summarizeSession(kept),
+        lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
+        gapTouches: entry === undefined ? 0 : entry.touches,
+        stopped: entry === undefined ? false : entry.stopped,
+        idleMinutes: entry === undefined ? null : +((Date.now() - entry.lastRealAt) / 60000).toFixed(1),
+        nextDueSeconds: entry === undefined ? null : Math.max(0, Math.round((entry.nextDueAt - Date.now()) / 1000))
+      };
+    }
+    return windows;
   }
 
   /** One record per task (conversation), newest first. */
@@ -668,6 +752,8 @@ export function apply(ctx) {
         costEstimate: +stats.cost.toFixed(4),
         savedEstimate: +saved.toFixed(4)
       },
+      /** Per-window "since this window was switched on" numbers (composer tooltip). */
+      windows: buildWindows(),
       tasks
     };
   }

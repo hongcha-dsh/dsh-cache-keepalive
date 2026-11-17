@@ -1,7 +1,11 @@
 {
   "name": "dsh-cache-keepalive",
-  "version": "0.5.2",
-  "private": true,
+  "version": "0.6.1",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hongcha-dsh/dsh-cache-keepalive.git"
+  },
   "type": "module",
   "description": "主会话空闲时自动重放最近一次请求，保持提示词缓存有效。",
   "exports": {
@@ -10,7 +14,7 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "assets/icon-180.png", "config.example.json", "README.md", "detail.md"],
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "config.example.json", "README.md", "detail.md"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
