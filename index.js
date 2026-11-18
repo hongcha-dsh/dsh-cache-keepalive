@@ -33,12 +33,17 @@ const DEFAULTS = {
   enabled: false,
   /** sessionId -> boolean: the per-conversation switch owned by the composer pill. */
   sessionEnabled: {},
-  intervalMinutes: 20,
+  /** Must stay below the route's cache TTL; Claude's is 5 min, so 4 is the safe default. */
+  intervalMinutes: 4,
   maxIdleMinutes: 150,
-  maxTouches: 8,
+  maxTouches: 15,
+  /** 0 = off. Otherwise 5-120: after this many idle minutes, compact the session once and stop keeping it alive. */
+  compactAfterMinutes: 0,
+  /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
+  prices: {},
   replayMaxTokens: 16,
   scanSeconds: 30,
-  maxSessions: 1,
+  maxSessions: 3,
   /** Empty list = follow whatever model the conversation is using. */
   routes: [],
   /** Optional per-route interval override, keyed "provider/model". */
@@ -74,6 +79,17 @@ function normalizeConfig(raw) {
   if (!Number.isFinite(cfg.replayMaxTokens) || cfg.replayMaxTokens < 1) cfg.replayMaxTokens = DEFAULTS.replayMaxTokens;
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
   if (!Number.isFinite(cfg.maxSessions) || cfg.maxSessions < 1) cfg.maxSessions = DEFAULTS.maxSessions;
+  const compact = Number(cfg.compactAfterMinutes);
+  cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : 0;
+  const prices = {};
+  if (cfg.prices && typeof cfg.prices === 'object' && !Array.isArray(cfg.prices)) {
+    for (const [key, value] of Object.entries(cfg.prices)) {
+      if (value && [value.hit, value.input, value.output, value.write].every((n) => Number.isFinite(Number(n)) && Number(n) >= 0)) {
+        prices[key] = { hit: Number(value.hit), input: Number(value.input), output: Number(value.output), write: Number(value.write) };
+      }
+    }
+  }
+  cfg.prices = prices;
   cfg.enabled = cfg.enabled === true;
   return cfg;
 }
@@ -101,7 +117,7 @@ function appendLog(record) {
 }
 
 export const name = 'cache-keepalive';
-export const inject = ['llm', 'sessions'];
+export const inject = ['llm', 'sessions', 'agents', 'commands'];
 
 export function apply(ctx) {
   let cfg = loadConfig();
@@ -133,14 +149,26 @@ export function apply(ctx) {
   /** Browser-side diagnostics reported by client.js (bundle load, slot registration errors). */
   const clientDiagnostics = [];
   /**
-   * CNY per 1M tokens, kimi-k3.1-pro list price (official domestic price page):
-   * input ¥13, hit ¥1.3, output ¥68, cache write (5m TTL) ¥13. Only used for
-   * the estimate labels.
+   * CNY per 1M tokens, keyed "provider/model". Estimate labels only, not a bill.
+   * kimi: official domestic list price. blsc-anthropic: AI 智算云 market price
+   * (hit = 0.1 x input); its cache-write price is not published, so write is
+   * assumed to be Anthropic's standard 1.25 x input. Override via config.prices.
+   * A route with no entry here is costed at 0 and reports no savings.
    */
-  const PRICE = { hit: 1.3, input: 13, output: 68, write: 13 };
-
+  const DEFAULT_PRICES = {
+    'kimi-coding/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13 },
+    'huosan/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13 },
+    'blsc-anthropic/Claude-Sonnet-5.5': { hit: 0.1944, input: 1.9444, output: 9.7222, write: 2.4306 },
+    'blsc-anthropic/Claude-Opus-5.5': { hit: 0.1944, input: 3.8889, output: 19.4444, write: 4.8611 }
+  };
+  const NO_PRICE = { hit: 0, input: 0, output: 0, write: 0 };
+  function priceFor(provider, model) {
+    const key = routeKeyOf(provider, model);
+    return cfg.prices[key] ?? DEFAULT_PRICES[key] ?? NO_PRICE;
+  }
   function priceOf(record) {
-    return ((record.cacheRead ?? 0) * PRICE.hit + (record.input ?? 0) * PRICE.input + (record.output ?? 0) * PRICE.output) / 1e6;
+    const price = priceFor(record.provider, record.model);
+    return ((record.cacheRead ?? 0) * price.hit + (record.input ?? 0) * price.input + (record.output ?? 0) * price.output) / 1e6;
   }
   function remember(record) {
     history.push(record);
@@ -320,10 +348,9 @@ export function apply(ctx) {
    * price PLUS a C-token 5m cache write (official billing counts both), i.e.
    * (input + write) per token; keeping the cache warm costs `touches` cache
    * reads at the hit price. So net = C * hit * (R - touches), R = (input+write)/hit
-   * = 20 for kimi-k3.1-pro. A gap whose only outcomes were misses/errors saved
+   * = 20 for kimi-k3.1-pro (22.5 for the Claude route). A gap whose only outcomes were misses/errors saved
    * nothing and cost cash.
    */
-  const PRICE_RATIO = (PRICE.input + PRICE.write) / PRICE.hit;
   function summarizeSession(records) {
     const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
     const gaps = [];
@@ -343,7 +370,7 @@ export function apply(ctx) {
       let gap = gaps[gaps.length - 1];
       // `touch` restarts at 1 whenever a real request re-captures the session.
       if (gap === undefined || touch <= previousTouch) {
-        gap = { touches: 0, cache: 0, hit: false, cost: 0 };
+        gap = { touches: 0, cache: 0, hit: false, cost: 0, provider: record.provider, model: record.model };
         gaps.push(gap);
       }
       previousTouch = touch;
@@ -355,8 +382,10 @@ export function apply(ctx) {
       }
     }
     for (const gap of gaps) {
+      const price = priceFor(gap.provider, gap.model);
+      const ratio = price.hit > 0 ? (price.input + price.write) / price.hit : 0;
       summary.saved += gap.hit
-        ? (gap.cache * Math.max(0, PRICE_RATIO - gap.touches) * PRICE.hit) / 1e6
+        ? (gap.cache * Math.max(0, ratio - gap.touches) * price.hit) / 1e6
         : -gap.cost;
     }
     summary.cost = +summary.cost.toFixed(6);
@@ -551,8 +580,10 @@ export function apply(ctx) {
   }
 
   function observe(iterable, sessionId) {
-    inflight.add(sessionId);
     return (async function* observeStream() {
+      // Marked in-flight only once iteration starts, so a stream that is closed
+      // before its first pull can never leave the session stuck as in-flight.
+      inflight.add(sessionId);
       try {
         for await (const chunk of iterable) {
           try {
@@ -586,6 +617,53 @@ export function apply(ctx) {
     return options;
   }
 
+  /** Run the official compaction once. Mirrors dsh-auto-compact's channel order: scoped service first, `/compact` command second. */
+  async function runCompaction(agent, signal) {
+    let compaction;
+    try {
+      compaction = agent?.ctx?.get?.('compaction');
+    } catch {
+      compaction = undefined;
+    }
+    if (compaction !== undefined && compaction !== null && typeof compaction.compactNow === 'function') {
+      const result = await compaction.compactNow(agent, signal);
+      if (result === null) return { via: 'service', kind: 'noop', text: 'nothing to compact' };
+      const tokens = typeof result.shadowedTokenCount === 'number' ? result.shadowedTokenCount : 0;
+      return { via: 'service', kind: 'success', text: 'compacted ~' + tokens + ' tokens' };
+    }
+    const execution = await ctx.commands.execute(agent, '/compact', [], signal);
+    if (execution === undefined) return { via: 'command', kind: 'missing', text: 'no /compact command in this session' };
+    const result = execution.result ?? {};
+    return { via: 'command', kind: result.kind ?? 'unknown', text: result.text ?? '' };
+  }
+
+  /**
+   * Idle long enough: compact once through the official backend, then stop keeping
+   * this session alive. The entry is marked stopped BEFORE the call, so a failure or
+   * a no-op can never retrigger; the next real request re-captures and re-arms it.
+   * Never runs while the agent is not idle or a model stream is in flight.
+   */
+  async function compactIdle(sessionId, entry) {
+    const agent = ctx.agents.get(sessionId);
+    if (agent === undefined) {
+      entry.stopped = true;
+      appendLog({ kind: 'compact', session: sessionId, status: 'skipped', reason: 'no-agent' });
+      return;
+    }
+    if (agent.status !== 'idle' || inflight.has(sessionId)) return;
+    busy = true;
+    entry.stopped = true;
+    const idleMinutes = +((Date.now() - entry.lastRealAt) / 60000).toFixed(1);
+    try {
+      const result = await runCompaction(agent, AbortSignal.timeout(10 * 60_000));
+      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: result.kind, via: result.via, text: result.text, idleMinutes, touches: entry.touches });
+    } catch (error) {
+      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'error', error: String(error?.message ?? error), idleMinutes, touches: entry.touches });
+    } finally {
+      busy = false;
+    }
+  }
+
   async function replay(sessionId, entry) {
     if (!sessionEnabledOf(sessionId)) {
       entry.stopped = true;
@@ -594,7 +672,12 @@ export function apply(ctx) {
     }
     if (busy) return;
     if (entry.stopped) return;
-    if (entry.touches >= cfg.maxTouches) {
+    if (cfg.compactAfterMinutes > 0 && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000) {
+      await compactIdle(sessionId, entry);
+      return;
+    }
+    // With compaction on, the compaction itself ends the idle gap; the touch cap only guards the compaction-off case.
+    if (cfg.compactAfterMinutes === 0 && entry.touches >= cfg.maxTouches) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-touches', touches: entry.touches });
       return;
@@ -712,6 +795,7 @@ export function apply(ctx) {
         maxIdleMinutes: cfg.maxIdleMinutes,
         maxTouches: cfg.maxTouches,
         replayMaxTokens: cfg.replayMaxTokens,
+        compactAfterMinutes: cfg.compactAfterMinutes,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,
         routes: cfg.routes,

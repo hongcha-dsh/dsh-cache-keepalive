@@ -1,18 +1,27 @@
 {
   "enabled": false,
   "sessionEnabled": {},
-  "intervalMinutes": 20,
+  "intervalMinutes": 4,
   "maxIdleMinutes": 150,
-  "maxTouches": 8,
+  "maxTouches": 15,
+  "compactAfterMinutes": 0,
   "replayMaxTokens": 16,
-  "scanSeconds": 30,
-  "maxSessions": 1,
+  "scanSeconds": 15,
+  "maxSessions": 3,
   "routes": [
-    { "provider": "kimi-coding", "model": "kimi-k3.1-pro" }
+    {
+      "provider": "blsc-anthropic",
+      "model": "Claude-Sonnet-5.5"
+    },
+    {
+      "provider": "blsc-anthropic",
+      "model": "Claude-Opus-5.5"
+    }
   ],
   "routeIntervals": {
     "kimi-coding/kimi-k3.1-pro": 20,
     "huosan/kimi-k3.1-pro": 5
   },
+  "prices": {},
   "requireProvenCache": true
 }

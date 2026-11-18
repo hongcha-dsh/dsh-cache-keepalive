@@ -180,7 +180,7 @@ window.__ModuleLoader__.load({
               }, '保存')
             ),
             h('p', { style: { ...label, margin: 0 } },
-              '成本按 kimi-coding 列表价估算；每次空闲最多 8 次保活。'),
+              '成本按所配价格表估算（config.prices）；每次空闲有保活次数上限。'),
             message ? h('p', { style: { ...label, margin: 0 } }, message) : null
           ),
 

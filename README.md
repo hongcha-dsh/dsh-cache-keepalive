@@ -119,3 +119,16 @@ These serve the card. They expose only token counts, task titles and config — 
 - A `session-switch: true` line whose session is no longer enabled reports nothing: an epoch only
   exists for a window that is currently on (v0.6.1).
 
+
+---
+
+## Fork notes (dsh-cache-keeper)
+
+Local fork of `hongcha-dsh/dsh-cache-keepalive` v0.6.1 for Claude routes. Changes:
+
+- **Claude-safe defaults**: `intervalMinutes` 4 (Claude's cache TTL is 5 min), `maxTouches` 15, `maxSessions` 3.
+- **Per-route prices** (`prices`, CNY / 1M tokens, keyed `provider/model`; built-in entries for kimi and `blsc-anthropic` Claude Sonnet/Opus). Cost and net-savings estimates now follow the replayed route instead of a hard-coded kimi price. Unknown routes are costed at 0.
+- **Compact after idle** (`compactAfterMinutes`, `0` = off, otherwise clamped to 5-120): once a session has been idle that long and its agent is `idle`, run the official compaction once (scoped `compaction.compactNow`, falling back to `/compact`), then stop keeping that session alive. It is marked stopped before the call, so a failure or no-op never retriggers; the next real request re-arms keep-alive. With compaction on, the touch cap is not applied (compaction ends the gap). Outcome is logged as `kind: "compact"` in `keepalive.jsonl`. Do not install `dsh-auto-compact` together with this: it would compact after 3 idle minutes and defeat the keep-alive.
+- Compaction credit: the channel order is taken from `fpm0312/dsh-auto-compact`.
+
+Measured on the AI 智算云 relay (2026-11-18, Claude-Sonnet-5.5): `max_tokens: 0` is *not* honoured (the relay generates a full reply), `max_tokens: 1` is short-circuited and does not touch the cache, `max_tokens >= 2` hits and refreshes the cache. The default `replayMaxTokens: 16` is fine. See `../spike/FINDINGS.md`.
