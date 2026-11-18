@@ -503,7 +503,7 @@ window.__ModuleLoader__.load({
           }
         };
         const missing = typeof sessionId !== 'string' || sessionId.length === 0;
-        const interval = (config && config.intervalMinutes) || 20;
+        const interval = (config && config.intervalMinutes) || 4;
         const dot = missing || enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
         const pill = h('button', {
           ref: buttonRef,
@@ -526,28 +526,30 @@ window.__ModuleLoader__.load({
           style: {
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 6,
-            padding: '3px 10px',
+            gap: 5,
+            flex: '0 0 auto',
+            whiteSpace: 'nowrap',
+            writingMode: 'horizontal-tb',
+            padding: '2px 9px',
             margin: '0 4px',
             color: 'inherit',
-            background: 'transparent',
-            border: '1px solid rgba(127,127,127,0.35)',
+            background: enabled === true ? 'rgba(63,191,111,0.12)' : 'transparent',
+            border: '1px solid ' + (enabled === true ? 'rgba(63,191,111,0.45)' : 'rgba(127,127,127,0.3)'),
             borderRadius: 999,
             cursor: missing || busy ? 'default' : 'pointer',
             font: 'inherit',
             fontSize: 12,
-            lineHeight: 1.4,
+            lineHeight: 1.5,
             opacity: missing || busy ? 0.6 : 1
           }
         },
-          h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: dot, display: 'inline-block' } }),
-          h('span', null, '缓存保活'),
-          h('span', { style: { opacity: 0.65 } }, missing ? '未识别' : enabled === null ? '读取中' : enabled ? '本窗口开' : '本窗口关')
+          h('span', { style: { width: 6, height: 6, borderRadius: '50%', background: dot, display: 'inline-block', flex: '0 0 auto', boxShadow: enabled === true ? '0 0 0 3px rgba(63,191,111,0.18)' : 'none' } }),
+          h('span', { style: { opacity: enabled === true ? 1 : 0.6 } }, missing ? '保活?' : '保活')
         );
 
         if (!canFloat || missing) return pill;
         return h('span', {
-          style: { display: 'inline-flex', alignItems: 'center' },
+          style: { display: 'inline-flex', alignItems: 'center', flex: '0 0 auto', whiteSpace: 'nowrap' },
           onMouseEnter: openTip,
           onMouseLeave: closeTip,
           onFocus: openTip,
