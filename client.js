@@ -693,6 +693,24 @@ window.__ModuleLoader__.load({
                 return undefined;
               }
             });
+            // Also list the same card on the Plugins page of the Settings (Cmd+,) as its own entry.
+            ctx.slots.inject('plugins.item', () => {
+              try {
+                report('item-slot-inject');
+                return ctx.slots.register(
+                  {
+                    name: 'plugins.item',
+                    id: 'cache-keepalive',
+                    order: 90,
+                    label: () => '缓存保活'
+                  },
+                  StatusCard
+                );
+              } catch (error) {
+                report('item-register-error', (error && error.message) || error);
+                return undefined;
+              }
+            });
             ctx.slots.inject('conversation.composer.dock', () => {
               try {
                 report('composer-slot-inject');
