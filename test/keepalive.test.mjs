@@ -441,23 +441,24 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
     assert.equal(comp.calls, 1);
   });
 
-  test('e8 compactEnabled=false：永不压缩，maxTouches 仍生效（即使 compactAfterMinutes 合法）', async () => {
+  test('e8 compactEnabled=false：永不压缩，保活到 maxIdle 时长上限后 max-idle 停止（次数≈上限/间隔）', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 2 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxIdleMinutes: 20 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(60 * MIN);
     assert.equal(comp.calls, 0);
-    assert.equal(h.streamCalls.length, 2);
-    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-touches'));
+    assert.equal(h.streamCalls.length, 5, '20 分钟上限 / 4 分钟间隔 = 5 次保活');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
+    assert.ok(!h.logLines().some((l) => l.reason === 'max-touches'), '不再有 max-touches 停止原因');
   });
 
-  test('e9 压缩开启时不应用 maxTouches 上限', async () => {
+  test('e9 压缩开启时 maxIdle 小于 compactAfter 仍先压缩（上限 = max(maxIdle, compactAfter+1)）', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, maxTouches: 1 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, maxIdleMinutes: 5 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(9 * MIN + 30_000);
-    assert.equal(h.streamCalls.length, 2, '超过 maxTouches=1 仍继续保活');
-    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-touches'));
+    assert.equal(h.streamCalls.length, 2, '4、8 分钟两次保活，未触发 max-idle');
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
     await h.advance(MIN);
     assert.equal(comp.calls, 1);
   });
@@ -607,7 +608,7 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
   for (const bad of [-5, 0, 'abc', null, undefined]) {
     test(`g3 compactAfterMinutes=${JSON.stringify(bad)} → 回落为 20（19 分钟不压缩，21 分钟压缩）`, async () => {
       const c = comp();
-      h = await setup({ config: { compactEnabled: true, compactAfterMinutes: bad, maxTouches: 2 }, agents: { [SID]: agent('idle', c) }, compaction: c });
+      h = await setup({ config: { compactEnabled: true, compactAfterMinutes: bad }, agents: { [SID]: agent('idle', c) }, compaction: c });
       const st0 = await h.state();
       assert.equal(st0.config.compactAfterMinutes, 20);
       await h.real(HIT);
@@ -677,11 +678,12 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
     assert.equal(h.streamCalls[0].maxTokens, 16);
   });
 
-  test('g7 maxTouches=0 → 回落到 15（3 次重放后仍继续）', async () => {
+  test('g7 旧配置 maxTouches=0 被忽略（不再回落、不再限制次数）', async () => {
     h = await setup({ config: { maxTouches: 0 } });
     await h.real(HIT);
     await h.advance(12 * MIN);
-    assert.equal(h.streamCalls.length, 3);
+    assert.equal(h.streamCalls.length, 3, '由 maxIdle=60 / interval=4 决定，与 maxTouches 无关');
+    assert.ok(!('maxTouches' in (await h.state()).config) || (await h.state()).config.maxTouches === 15);
   });
 
   test('g8 routes 里的非法条目被丢弃 → 等同"任意路由"', async () => {
@@ -717,10 +719,10 @@ describe('h inflight 生命周期', () => {
 // ---------------- i. 窗口级压缩开关（新语义） ----------------
 const S2 = 's2';
 describe('i 窗口级压缩开关', () => {
-  test('i-a 两个窗口同时保活：仅 sessionCompact=true 的被压缩；另一个继续保活并受 maxTouches 约束', async () => {
+  test('i-a 两个窗口同时保活：仅 sessionCompact=true 的被压缩；另一个继续保活并受 maxIdle 时长上限约束', async () => {
     const comp = { calls: 0, args: [], compactNow: async (a) => { comp.calls += 1; comp.args.push(a); return { shadowedTokenCount: 1 }; } };
     h = await setup({
-      config: { sessionEnabled: { [SID]: true, [S2]: true }, compactEnabled: false, sessionCompact: { [SID]: true }, compactAfterMinutes: 10, maxTouches: 3 },
+      config: { sessionEnabled: { [SID]: true, [S2]: true }, compactEnabled: false, sessionCompact: { [SID]: true }, compactAfterMinutes: 10, maxIdleMinutes: 12 },
       agents: { [SID]: agent('idle', comp), [S2]: agent('idle', comp) },
       compaction: comp
     });
@@ -735,9 +737,9 @@ describe('i 窗口级压缩开关', () => {
     assert.equal(compacts[0].session, SID);
 
     const reps = h.streamCalls.map((o) => o.sessionId);
-    assert.equal(reps.filter((x) => x === S2).length, 3, 's2 受 maxTouches=3 约束');
-    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.session === S2 && l.reason === 'max-touches'));
-    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.session === SID && l.reason === 'max-touches'), 's1 压缩时不应用 maxTouches');
+    assert.equal(reps.filter((x) => x === S2).length, 3, 's2 受 maxIdle=12 / interval=4 = 3 次约束');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.session === S2 && l.reason === 'max-idle'));
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.session === SID && l.reason === 'max-idle'), 's1 压缩后不因时长上限停止');
 
     const st = await h.state();
     assert.equal(st.windows[SID].compact, true);
@@ -747,21 +749,22 @@ describe('i 窗口级压缩开关', () => {
   test('i-b sessionCompact[id]=false 覆盖 compactEnabled=true', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
     h = await setup({
-      config: { compactEnabled: true, compactAfterMinutes: 10, sessionCompact: { [SID]: false }, maxTouches: 2 },
+      config: { compactEnabled: true, compactAfterMinutes: 10, sessionCompact: { [SID]: false }, maxIdleMinutes: 8 },
       agents: { [SID]: agent('idle', comp) },
       compaction: comp
     });
     await h.real(HIT);
     await h.advance(60 * MIN);
     assert.equal(comp.calls, 0, '显式 false 覆盖默认 true');
-    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-touches'), '关闭压缩后 maxTouches 生效');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'), '关闭压缩后按 maxIdle 停止');
+    assert.equal(h.streamCalls.length, 2, '8 分钟上限 / 4 分钟间隔 = 2 次');
     const st = await h.state();
     assert.equal(st.windows[SID].compact, false);
   });
 
   test('i-c 运行中途经端点把压缩从关改开，到点压缩；再改关则不再压缩', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(5 * MIN);
     assert.equal((await h.state()).windows[SID].compact, false);
@@ -787,7 +790,7 @@ describe('i 窗口级压缩开关', () => {
 
   test('i-c2 运行中途改为开启：此前已过的空闲时间直接满足阈值，立即压缩（下一 tick）', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(12 * MIN);
     assert.equal(comp.calls, 0);
@@ -914,7 +917,7 @@ describe('j 端点防 CSRF、白名单、上限', () => {
     });
     assert.equal(r.status, 200);
     const cfg = (await h.state()).config;
-    assert.equal(cfg.maxTouches, 7);
+    assert.equal(cfg.maxTouches, 15, 'maxTouches 请求体被忽略，仍为推导值 60/4');
     assert.equal(cfg.compactEnabled, true, '白名单内字段生效');
     assert.deepEqual(cfg.routes, [CLAUDE], 'routes 不得被端点改写');
     assert.deepEqual(cfg.sessionEnabled, {}, 'sessionEnabled 不得被端点改写');
@@ -931,23 +934,18 @@ describe('j 端点防 CSRF、白名单、上限', () => {
     }
   });
 
-  test('j5 数值上限：intervalMinutes≤60、maxIdle≤1440、maxTouches≤100(整数)、replayMaxTokens≤64、maxSessions≤10', async () => {
+  test('j5 数值上限：intervalMinutes≤60、maxIdle≤1440、replayMaxTokens≤64、maxSessions≤10', async () => {
     h = await setup();
-    const r = await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 500, maxIdleMinutes: 99999, maxTouches: 1000, replayMaxTokens: 1000, maxSessions: 50 } });
+    const r = await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 500, maxIdleMinutes: 99999, replayMaxTokens: 1000, maxSessions: 50 } });
     assert.equal(r.status, 200);
     const cfg = (await h.state()).config;
     assert.equal(cfg.intervalMinutes, 60);
     assert.equal(cfg.maxIdleMinutes, 1440);
-    assert.equal(cfg.maxTouches, 100);
+    assert.equal(cfg.maxTouches, 24, '派生值 1440 / 60 = 24');
     assert.equal(cfg.replayMaxTokens, 64);
     assert.equal(cfg.maxSessions, 10);
   });
 
-  test('j5b maxTouches 小数向下取整（2.7 → 2）', async () => {
-    h = await setup();
-    await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 2.7 } });
-    assert.equal((await h.state()).config.maxTouches, 2);
-  });
 });
 
 // ---------------- k. 重放看门狗（60 秒） ----------------
@@ -1016,8 +1014,8 @@ describe('l 命中判定', () => {
 
 // ---------------- m. 过期保护（stale） ----------------
 describe('m 过期保护', () => {
-  test('m1 一次性快进 100 分钟 → 0 次重放，stopped，reason stale', async () => {
-    h = await setup();
+  test('m1 一次性快进 100 分钟（maxIdle 放宽到 1440）→ 0 次重放，stopped，reason stale', async () => {
+    h = await setup({ config: { maxIdleMinutes: 1440 } });
     await h.real(HIT);
     mock.timers.tick(100 * MIN);
     await settle();
@@ -1070,7 +1068,7 @@ describe('o 压缩不占全局 busy', () => {
   test('o1 压缩挂起时，另一会话仍照常重放', async () => {
     const comp = { calls: 0, compactNow: () => { comp.calls += 1; return new Promise(() => {}); } };
     h = await setup({
-      config: { sessionEnabled: { [SID]: true, [S2]: true }, sessionCompact: { [SID]: true, [S2]: false }, compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 },
+      config: { sessionEnabled: { [SID]: true, [S2]: true }, sessionCompact: { [SID]: true, [S2]: false }, compactEnabled: false, compactAfterMinutes: 10 },
       agents: { [SID]: agent('idle', comp) },
       compaction: comp
     });
@@ -1171,11 +1169,11 @@ describe('r 配置健壮性', () => {
     fs.watchFile = (p, opts, fn) => { watchedWith = fn; listener = fn; };
     fs.unwatchFile = (p, fn) => { unwatchedWith = fn; };
     try {
-      h = await setup({ config: { maxTouches: 7 } });
-      assert.equal((await h.state()).config.maxTouches, 7);
+      h = await setup({ config: { intervalMinutes: 7 } });
+      assert.equal((await h.state()).config.intervalMinutes, 7);
       fs.writeFileSync(path.join(h.dir, 'config.json'), '{ broken json');
       listener();
-      assert.equal((await h.state()).config.maxTouches, 7, '解析失败不得重置为默认');
+      assert.equal((await h.state()).config.intervalMinutes, 7, '解析失败不得重置为默认');
       assert.ok(h.logLines().some((l) => l.kind === 'config-error'));
       // 具名 listener：unwatch 必须传同一个函数
       const listenerUsed = listener;
@@ -1206,10 +1204,10 @@ describe('r 配置健壮性', () => {
 
   test('r2 saveConfig 原子写：POST 后目录中不残留 config.json.tmp，config.json 为合法 JSON', async () => {
     h = await setup();
-    await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 9 } });
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 90 } });
     assert.equal(fs.existsSync(path.join(h.dir, 'config.json.tmp')), false);
     const parsed = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
-    assert.equal(parsed.maxTouches, 9);
+    assert.equal(parsed.maxIdleMinutes, 90);
   });
 
   test('r3 sessionEnabled 重写已有 key → 移到队尾', async () => {
@@ -1240,5 +1238,72 @@ describe('r 配置健壮性', () => {
     assert.equal(Object.keys(sc).length, 300);
     assert.equal(sc.c0, true);
     assert.equal(sc.newc, true);
+  });
+});
+
+// ---------------- s. maxTouches 移除：配置迁移、派生值、默认值 ----------------
+describe('s maxTouches 已移除（派生只读）', () => {
+  test('s1 旧 config.json 含 maxTouches：被忽略，保存后磁盘上不再出现', async () => {
+    h = await setup({ config: { maxTouches: 3, maxIdleMinutes: 60 } });
+    const st = await h.state();
+    assert.equal(st.config.maxTouches, 15, '派生值 60/4，旧键 3 不生效');
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 61 } }); // 触发 saveConfig
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.equal(Object.prototype.hasOwnProperty.call(onDisk, 'maxTouches'), false, '保存后不得再写入 maxTouches');
+    assert.equal(onDisk.maxIdleMinutes, 61);
+  });
+
+  test('s2 POST /config 带 maxTouches：被忽略（白名单外），不写盘', async () => {
+    h = await setup();
+    const r = await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 2 } });
+    assert.equal(r.status, 200);
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.equal(Object.prototype.hasOwnProperty.call(onDisk, 'maxTouches'), false);
+    assert.equal((await h.state()).config.maxTouches, 15, '派生值不受输入影响');
+  });
+
+  test('s3 state.config.maxTouches = floor(maxIdle/interval)，改任一项都会随之变化', async () => {
+    h = await setup({ config: { maxIdleMinutes: 60, intervalMinutes: 4 } });
+    assert.equal((await h.state()).config.maxTouches, 15);
+    await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 7 } });
+    assert.equal((await h.state()).config.maxTouches, 8, 'floor(60/7)=8');
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 100 } });
+    assert.equal((await h.state()).config.maxTouches, 14, 'floor(100/7)=14');
+    await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 60, maxIdleMinutes: 5 } });
+    assert.equal((await h.state()).config.maxTouches, 1, '下限为 1');
+  });
+
+  test('s3b 派生值只读：请求体中的 maxTouches 对 state 无影响', async () => {
+    h = await setup({ config: { maxIdleMinutes: 60, intervalMinutes: 4 } });
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 999 } });
+    assert.equal((await h.state()).config.maxTouches, 15);
+  });
+
+  test('s4 默认 maxIdleMinutes = 60（无配置时）', async () => {
+    h = await setup({ config: {} });
+    // 去掉 config.json 中的 maxIdleMinutes，检验默认值
+    const cfgPath = path.join(h.dir, 'config.json');
+    const cur = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    delete cur.maxIdleMinutes;
+    fs.writeFileSync(cfgPath, JSON.stringify(cur));
+    await h.http(CONFIG_EP, { method: 'POST', body: { scanSeconds: 30 } }); // 重新读盘并规范化
+    assert.equal((await h.state()).config.maxIdleMinutes, 60);
+  });
+
+  test('s4b 默认下真实运行：到 60 分钟上限 → max-idle（15 次保活）', async () => {
+    h = await setup();
+    await h.real(HIT);
+    await h.advance(70 * MIN);
+    assert.equal(h.streamCalls.length, 15, '60 / 4 = 15');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
+  });
+
+  test('s5 压缩开启时 maxIdle 小于 compactAfter：仍先压缩，不因 max-idle 抢先停止（原用例保留）', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 20, maxIdleMinutes: 5 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(20 * MIN + 30_000);
+    assert.equal(comp.calls, 1, '20 分钟先压缩');
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
   });
 });

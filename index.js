@@ -17,7 +17,7 @@
  *   - Only user-visible main sessions are armed (subagent/fork sessions skipped).
  *   - Only routes listed in config.routes are touched.
  *   - A replay that misses (cacheRead === 0) disables that session immediately.
- *   - Hard caps: maxTouches per idle gap, maxIdleMinutes, one replay in flight.
+ *   - Hard caps: maxIdleMinutes per idle gap (the touch count is derived from it: maxIdleMinutes / interval), one replay in flight.
  *   - Config is re-read from config.json when the file changes (2s poll).
  */
 
@@ -35,8 +35,7 @@ const DEFAULTS = {
   sessionEnabled: {},
   /** Must stay below the route's cache TTL; Claude's is 5 min, so 4 is the safe default. */
   intervalMinutes: 4,
-  maxIdleMinutes: 150,
-  maxTouches: 15,
+  maxIdleMinutes: 60,
   /** Idle minutes (5-120) before a compaction-enabled window is compacted once, after which keep-alive stops for it. */
   compactAfterMinutes: 20,
   /** Default for a window that never chose explicitly. Off: compaction is always opt-in per window. */
@@ -79,10 +78,10 @@ function normalizeConfig(raw) {
   cfg.requireProvenCache = cfg.requireProvenCache !== false;
   if (!Number.isFinite(cfg.intervalMinutes) || cfg.intervalMinutes <= 0) cfg.intervalMinutes = DEFAULTS.intervalMinutes;
   if (!Number.isFinite(cfg.maxIdleMinutes) || cfg.maxIdleMinutes <= 0) cfg.maxIdleMinutes = DEFAULTS.maxIdleMinutes;
-  if (!Number.isFinite(cfg.maxTouches) || cfg.maxTouches < 1) cfg.maxTouches = DEFAULTS.maxTouches;
+  // Legacy key: the touch count is now derived from maxIdleMinutes / intervalMinutes, never configured.
+  delete cfg.maxTouches;
   cfg.intervalMinutes = Math.min(cfg.intervalMinutes, 60);
   cfg.maxIdleMinutes = Math.min(cfg.maxIdleMinutes, 1440);
-  cfg.maxTouches = Math.min(Math.floor(cfg.maxTouches), 100);
   if (!Number.isFinite(cfg.replayMaxTokens) || cfg.replayMaxTokens < 1) cfg.replayMaxTokens = DEFAULTS.replayMaxTokens;
   cfg.replayMaxTokens = Math.min(Math.floor(cfg.replayMaxTokens), 64);
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
@@ -148,7 +147,7 @@ const REPLAY_TIMEOUT_MS = 60_000;
 const HIT_RATIO = 0.6;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
-const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'maxTouches', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
 
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions', 'agents', 'commands'];
@@ -757,12 +756,6 @@ export function apply(ctx) {
     if (entry.stopped) return;
     const compactOn = compactEnabledOf(sessionId);
     if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && startCompaction(sessionId, entry)) return;
-    // With compaction on for this window, the compaction itself ends the idle gap; the touch cap only guards the compaction-off case.
-    if (!compactOn && entry.touches >= cfg.maxTouches) {
-      entry.stopped = true;
-      appendLog({ kind: 'stop', session: sessionId, reason: 'max-touches', touches: entry.touches });
-      return;
-    }
     const now = Date.now();
     // With compaction on, the idle cap must leave room for the compaction to happen first.
     const idleCapMinutes = compactOn ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
@@ -916,7 +909,8 @@ export function apply(ctx) {
         sessionEnabled: cfg.sessionEnabled,
         intervalMinutes: cfg.intervalMinutes,
         maxIdleMinutes: cfg.maxIdleMinutes,
-        maxTouches: cfg.maxTouches,
+        /** Derived, read-only: how many keep-alives fit in the idle cap at the configured interval. */
+        maxTouches: Math.max(1, Math.floor(cfg.maxIdleMinutes / cfg.intervalMinutes)),
         replayMaxTokens: cfg.replayMaxTokens,
         compactAfterMinutes: cfg.compactAfterMinutes,
         compactEnabled: cfg.compactEnabled,
@@ -1037,7 +1031,7 @@ export function apply(ctx) {
             const patch = {};
             for (const key of CONFIG_PATCH_KEYS) if (Object.prototype.hasOwnProperty.call(raw, key)) patch[key] = raw[key];
             cfg = saveConfig({ ...cfg, ...patch });
-            appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
+            appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
             send(res, 200, { ok: true, config: cfg });
           } catch (error) {
             send(res, 400, { error: String(error?.message ?? error) });
@@ -1212,7 +1206,7 @@ export function apply(ctx) {
   registerStatusRoutes();
 
   ctx.effect(function* keepaliveLifecycle() {
-    appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
+    appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
     const timer = setInterval(() => {
       tick().catch((error) => {
         ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
@@ -1236,7 +1230,7 @@ export function apply(ctx) {
         const changed = JSON.stringify(next) !== JSON.stringify(cfg);
         cfg = next;
         if (changed) {
-          appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
+          appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
         }
       } catch {
         /* keep previous config */
