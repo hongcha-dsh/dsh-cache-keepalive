@@ -210,7 +210,7 @@ window.__ModuleLoader__.load({
       const FIELDS = {
         intervalMinutes: { min: 1, max: 60 },
         maxIdleMinutes: { min: 1, max: 1440 },
-        replayMaxTokens: { min: 1, max: 64 },
+        replayMaxTokens: { min: 2, max: 64 },
         compactAfterMinutes: { min: 5, max: 120 }
       };
       // Raw text -> { ok, value } | { ok:false, error }. Empty / non-integer / out of range never reaches the Host.
@@ -353,7 +353,7 @@ window.__ModuleLoader__.load({
         const iv = validNow('intervalMinutes');
         const mx = validNow('maxIdleMinutes');
         const derived = typeof iv === 'number' && typeof mx === 'number' && iv > 0 ? Math.floor(mx / iv) : config.maxTouches;
-        const derivedText = typeof derived !== 'number' ? '—' : derived < 1 ? '不足 1 次，请缩短间隔或延长时长' : '约 ' + tokens(derived) + ' 次保活（自动计算）';
+        const derivedText = typeof derived !== 'number' ? '—' : derived < 1 ? '不足 1 次，请缩短间隔或延长时长' : '约 ' + tokens(derived) + ' 次保活（按上方间隔自动计算；个别线路的间隔不同）';
         const compactMinutes = validNow('compactAfterMinutes') || 20;
 
         const numberInput = (key, unit, title) => h(React.Fragment, null,
@@ -423,7 +423,7 @@ window.__ModuleLoader__.load({
               }, numberInput('maxIdleMinutes', '分钟', '最长保活时长（分钟）')),
               h(SettingRow, {
                 title: '重放输出上限',
-                desc: '每次保活最多生成的 token 数。中转站上需要 ≥ 2 才会命中缓存。范围 1–64。',
+                desc: '每次保活最多生成的 token 数。中转站可能把 1 直接短路而不碰缓存，所以至少为 2。范围 2–64。',
                 error: errors.replayMaxTokens
               }, numberInput('replayMaxTokens', 'token', '重放输出上限')),
               h(SettingRow, {
@@ -617,7 +617,7 @@ window.__ModuleLoader__.load({
             );
           }),
           h('p', { className: 'ka-foot', style: { padding: '10px 14px', borderTop: '1px solid var(--ka-b1)' } },
-            '净省 = 每次空闲期保住缓存所避免的一次冷重算花费（输入价 + 5 分钟缓存写入费）− 该空闲期所有保活花费。金额均为按价格表的估算，不是账单。')
+            '净省 = 缓存过期后下一次请求要整段重写缓存的额外花费（写入价 − 读取价）− 该空闲期所有保活花费。只统计之后用户确实回来发了请求的空闲期；金额均为按价格表的估算，不是账单。')
         );
       }
 
@@ -855,7 +855,7 @@ window.__ModuleLoader__.load({
           }
         };
         const missing = typeof sessionId !== 'string' || sessionId.length === 0;
-        const interval = (config && config.intervalMinutes) || 4;
+        const interval = (state && state.windows && state.windows[sessionId] && state.windows[sessionId].intervalMinutes) || (config && config.intervalMinutes) || 4;
         const dot = missing || enabled === null ? 'rgba(127,127,127,0.55)' : enabled ? '#3fbf6f' : 'rgba(127,127,127,0.55)';
         const pill = h('button', {
           ref: buttonRef,
@@ -964,7 +964,7 @@ window.__ModuleLoader__.load({
             rect: tip.rect,
             enabled: enabled === null ? null : enabled === true,
             win: state && state.windows ? state.windows[sessionId] : null,
-            interval,
+            interval: (state && state.windows && state.windows[sessionId] && state.windows[sessionId].intervalMinutes) || interval,
             onEnter: openTip,
             onLeave: closeTip
           })

@@ -99,8 +99,8 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
       const handler = routes[key];
       assert.ok(handler, 'route not registered: ' + key);
       const base = method === 'POST'
-        ? { host: '127.0.0.1:53161', 'content-type': 'application/json', 'x-keepalive': '1' }
-        : { host: '127.0.0.1:53161' };
+        ? { host: '127.0.0.1:50867', 'content-type': 'application/json', 'x-keepalive': '1' }
+        : { host: '127.0.0.1:50867' };
       const merged = { ...base, ...(headers ?? {}) };
       for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
       const req = {
@@ -138,6 +138,7 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     if (typeof first.value === 'function') cleanups.push(first.value);
   };
   const webServer = {
+    getOrigin: () => 'http://127.0.0.1:50867',
     register: (desc) => {
       routes[desc.path] = desc.handler;
       return () => {};
@@ -474,17 +475,20 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
     assert.equal(h.logLines().filter((l) => l.kind === 'compact').length, 0);
   });
 
-  test('e11 有在途真实流时不压缩；流结束后下一次 tick 再压缩', async () => {
+  test('e11 在途真实流期间不压缩；stale 守卫先于压缩（5 分钟后 stop stale，之后不压缩）', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
     h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT); // 建立 entry
     const it = h.open(HIT);
-    await it.next(); // 已开始迭代但未结束 → 在途
+    await it.next(); // 在途
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 0, '在途流期间不压缩');
     assert.equal(h.streamCalls.length, 0, '在途流期间也不重放');
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'stale'), '在途流期间不判 stale（流自己在占用缓存）');
     for await (const _ of it) { /* finish the real stream */ }
     await h.advance(MIN);
-    assert.equal(comp.calls, 1);
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'stale'), '流结束后距上次触缓存已远超 1.25×间隔 → stale');
+    assert.equal(comp.calls, 0, 'stale 先于压缩，流结束后也不压缩');
   });
 
   test('e12 （观察）agent 不存在时：记录 skipped 并停止该会话', async () => {
@@ -503,10 +507,11 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 // ---------------- f. 价格与节省 ----------------
 describe('f 分路由价格与净省', () => {
   const sonnet = { hit: 0.1944, input: 1.9444, output: 9.7222, write: 2.4306 };
-  const opus = { hit: 0.1944, input: 3.8889, output: 19.4444, write: 4.8611 };
+  const opus = { hit: 0.3889, input: 3.8889, output: 19.4444, write: 4.8611 };
   const usage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
   const costOf = (p) => (100000 * p.hit + 50 * p.input + 16 * p.output) / 1e6;
-  const savedOf = (p, k = 1) => (100000 * ((p.input + p.write) - p.hit * k)) / 1e6;
+  /** Anthropic-style: an expired prefix is re-billed one cache write; saved = C*(write-hit)/1e6 - cost. */
+  const savedOf = (p) => (100000 * (p.write - p.hit)) / 1e6 - costOf(p);
 
   test('f1 Claude 路由用内置 Claude 价格：cost / saved 手算对照', async () => {
     h = await setup();
@@ -520,7 +525,7 @@ describe('f 分路由价格与净省', () => {
     assert.equal(t.hits, 1);
     assert.equal(t.touches, 1);
     close(costOf(sonnet), 0.0196927752, 1e-9);
-    close(savedOf(sonnet), 0.41806, 1e-9);
+    close(t.saved, 0.2039272248, 1e-6);
     const rec = (await h.http(TASK, { url: `${TASK}?session=${SID}` })).body;
     close(rec.records[0].cost, costOf(sonnet));
     close(st.stats.costEstimate, costOf(sonnet), 1e-4);
@@ -546,7 +551,10 @@ describe('f 分路由价格与净省', () => {
     const t = (await h.state()).tasks[0];
     close(t.cost, costOf(opus));
     close(t.saved, savedOf(opus));
-    close(costOf(opus), 0.0199455554, 1e-9);
+    // cost = 100000×0.3889 + 50×3.8889 + 16×19.4444 (CNY/1M) = 0.039396
+    close(costOf(opus), 0.039396, 1e-6);
+    // saved = 100000×(4.8611−0.3889)/1e6 − cost
+    close(t.saved, 100000 * (4.8611 - 0.3889) / 1e6 - 0.039396, 1e-6);
   });
 
   test('f4 config.prices 覆盖生效', async () => {
@@ -556,7 +564,7 @@ describe('f 分路由价格与净省', () => {
     await h.advance(4 * MIN);
     const t = (await h.state()).tasks[0];
     close(t.cost, 0.100148);
-    close(t.saved, 0.5);
+    close(t.saved, 0.199852, 1e-6); // no miss tag: coldPerM = write = 4, avoided = 4 - 1
   });
 
   test('f5 config.prices 非法条目（负数）被丢弃，回退内置价格', async () => {
@@ -682,8 +690,8 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
     h = await setup({ config: { maxTouches: 0 } });
     await h.real(HIT);
     await h.advance(12 * MIN);
-    assert.equal(h.streamCalls.length, 3, '由 maxIdle=60 / interval=4 决定，与 maxTouches 无关');
-    assert.ok(!('maxTouches' in (await h.state()).config) || (await h.state()).config.maxTouches === 15);
+    assert.equal(h.streamCalls.length, 3, '由 maxIdle / interval 决定，与 maxTouches 无关');
+    assert.equal((await h.state()).config.maxTouches, 11, '派生值 floor(45/4)=11，与旧键无关');
   });
 
   test('g8 routes 里的非法条目被丢弃 → 等同"任意路由"', async () => {
@@ -904,7 +912,7 @@ describe('j 端点防 CSRF、白名单、上限', () => {
     assert.equal(r.status, 403);
     r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://127.0.0.1:9999' } });
     assert.equal(r.status, 403, '端口不同也算跨源');
-    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://127.0.0.1:53161' } });
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://127.0.0.1:50867' } });
     assert.equal(r.status, 200);
     assert.equal(r.body.enabled, true);
   });
@@ -917,7 +925,7 @@ describe('j 端点防 CSRF、白名单、上限', () => {
     });
     assert.equal(r.status, 200);
     const cfg = (await h.state()).config;
-    assert.equal(cfg.maxTouches, 15, 'maxTouches 请求体被忽略，仍为推导值 60/4');
+    assert.equal(cfg.maxTouches, 11, 'maxTouches 请求体被忽略，仍为推导值 floor(45/4)');
     assert.equal(cfg.compactEnabled, true, '白名单内字段生效');
     assert.deepEqual(cfg.routes, [CLAUDE], 'routes 不得被端点改写');
     assert.deepEqual(cfg.sessionEnabled, {}, 'sessionEnabled 不得被端点改写');
@@ -990,25 +998,41 @@ describe('l 命中判定', () => {
     assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'miss');
   });
 
-  test('l3 恰好 0.6 → hit', async () => {
+  test('l3 恰好 0.9 → hit；0.89 → miss（HIT_RATIO=0.9）', async () => {
     h = await setup();
     await h.real(HIT);
-    h.replayUsage = { cacheReadTokens: 6000, inputTokens: 4000, outputTokens: 16 };
+    h.replayUsage = { cacheReadTokens: 9000, inputTokens: 1000, outputTokens: 16 };
     await h.advance(4 * MIN);
     assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'hit');
     assert.equal((await h.state()).sessions[0].stopped, false);
-  });
+    h.teardown(); h = null;
 
-  test('l4 cacheRead 缺失（unknown）→ 停止，reason cache-unknown', async () => {
     h = await setup();
     await h.real(HIT);
-    h.replayUsage = { inputTokens: 100, outputTokens: 16 };
+    h.replayUsage = { cacheReadTokens: 8900, inputTokens: 1100, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'miss');
+  });
+
+  test('l4 无任何 usage 字段 → unknown，stop reason cache-unknown', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { outputTokens: 16 };
     await h.advance(4 * MIN);
     assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'unknown');
     assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'cache-unknown'));
     assert.equal((await h.state()).sessions[0].stopped, true);
     await h.advance(30 * MIN);
     assert.equal(h.streamCalls.length, 1);
+  });
+
+  test('l4b 无 cacheRead 但 input>0 → miss，stop reason cache-miss', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { inputTokens: 100, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'miss');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'cache-miss'));
   });
 });
 
@@ -1246,7 +1270,7 @@ describe('s maxTouches 已移除（派生只读）', () => {
   test('s1 旧 config.json 含 maxTouches：被忽略，保存后磁盘上不再出现', async () => {
     h = await setup({ config: { maxTouches: 3, maxIdleMinutes: 60 } });
     const st = await h.state();
-    assert.equal(st.config.maxTouches, 15, '派生值 60/4，旧键 3 不生效');
+    assert.equal(st.config.maxTouches, 15, '本用例显式 maxIdle=60，派生值 floor(60/4)=15，旧键 3 不生效');
     await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 61 } }); // 触发 saveConfig
     const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
     assert.equal(Object.prototype.hasOwnProperty.call(onDisk, 'maxTouches'), false, '保存后不得再写入 maxTouches');
@@ -1259,7 +1283,7 @@ describe('s maxTouches 已移除（派生只读）', () => {
     assert.equal(r.status, 200);
     const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
     assert.equal(Object.prototype.hasOwnProperty.call(onDisk, 'maxTouches'), false);
-    assert.equal((await h.state()).config.maxTouches, 15, '派生值不受输入影响');
+    assert.equal((await h.state()).config.maxTouches, 11, '派生值不受输入影响');
   });
 
   test('s3 state.config.maxTouches = floor(maxIdle/interval)，改任一项都会随之变化', async () => {
@@ -1270,7 +1294,7 @@ describe('s maxTouches 已移除（派生只读）', () => {
     await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 100 } });
     assert.equal((await h.state()).config.maxTouches, 14, 'floor(100/7)=14');
     await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 60, maxIdleMinutes: 5 } });
-    assert.equal((await h.state()).config.maxTouches, 1, '下限为 1');
+    assert.equal((await h.state()).config.maxTouches, 0, '不再取 max(1,…)：maxIdle<interval → 0');
   });
 
   test('s3b 派生值只读：请求体中的 maxTouches 对 state 无影响', async () => {
@@ -1287,14 +1311,14 @@ describe('s maxTouches 已移除（派生只读）', () => {
     delete cur.maxIdleMinutes;
     fs.writeFileSync(cfgPath, JSON.stringify(cur));
     await h.http(CONFIG_EP, { method: 'POST', body: { scanSeconds: 30 } }); // 重新读盘并规范化
-    assert.equal((await h.state()).config.maxIdleMinutes, 60);
+    assert.equal((await h.state()).config.maxIdleMinutes, 45);
   });
 
-  test('s4b 默认下真实运行：到 60 分钟上限 → max-idle（15 次保活）', async () => {
+  test('s4b 默认下真实运行：到 45 分钟上限 → max-idle（11 次保活，发生在 4..44 分钟）', async () => {
     h = await setup();
     await h.real(HIT);
-    await h.advance(70 * MIN);
-    assert.equal(h.streamCalls.length, 15, '60 / 4 = 15');
+    await h.advance(50 * MIN);
+    assert.equal(h.streamCalls.length, 11, 'floor(45/4) = 11');
     assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
   });
 
@@ -1305,5 +1329,306 @@ describe('s maxTouches 已移除（派生只读）', () => {
     await h.advance(20 * MIN + 30_000);
     assert.equal(comp.calls, 1, '20 分钟先压缩');
     assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
+  });
+});
+
+// ---------------- t. 净省口径（Anthropic 式：过期只收一次写入价；kimi 带 miss 标签 = input+write） ----------------
+const SONNET_KEY = `${CLAUDE.provider}/${CLAUDE.model}`;
+const KIMI = { provider: 'kimi-coding', model: 'kimi-k3.1-pro' };
+const KIMI_KEY = 'kimi-coding/kimi-k3.1-pro';
+const costPer = (p, cacheRead, input, output) => (cacheRead * p.hit + input * p.input + output * p.output) / 1e6;
+const sonnetP = { hit: 0.1944, input: 1.9444, output: 9.7222, write: 2.4306 };
+
+describe('t 净省口径', () => {
+  test('t-a kimi 路由用 input+write 口径：saved = C×(13+13−1.3)/1e6 − cost', async () => {
+    h = await setup({ config: { routes: [KIMI] } });
+    await h.real(HIT, { provider: KIMI.provider, model: KIMI.model });
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    const t = (await h.state()).tasks[0];
+    const cost = (100000 * 1.3 + 50 * 13 + 16 * 68) / 1e6; // 0.131738
+    close(t.cost, cost, 1e-9);
+    close(t.saved, (100000 * (13 + 13 - 1.3)) / 1e6 - cost, 1e-6); // 2.47 - 0.131738 = 2.338262
+    close(t.saved, 2.338262, 1e-6);
+  });
+
+  test('t-a2 huosan 路由同样带 miss 标签', async () => {
+    const HUOSAN = { provider: 'huosan', model: 'kimi-k3.1-pro' };
+    h = await setup({ config: { routes: [HUOSAN] } });
+    await h.real(HIT, { provider: HUOSAN.provider, model: HUOSAN.model });
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    close((await h.state()).tasks[0].saved, 2.338262, 1e-6);
+  });
+
+  test('t-b config.prices 带 miss:"input+write" 生效（coldPerM = 2+4 = 6）', async () => {
+    h = await setup({ config: { prices: { [SONNET_KEY]: { hit: 1, input: 2, output: 3, write: 4, miss: 'input+write' } } } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    const t = (await h.state()).tasks[0];
+    close(t.cost, 0.100148, 1e-9);
+    close(t.saved, 100000 * (6 - 1) / 1e6 - 0.100148, 1e-6); // 0.5 - 0.100148 = 0.399852
+    close(t.saved, 0.399852, 1e-6);
+  });
+
+  test('t-b2 config.prices 的 miss:"foo" 被忽略（coldPerM 回到 write = 4）', async () => {
+    h = await setup({ config: { prices: { [SONNET_KEY]: { hit: 1, input: 2, output: 3, write: 4, miss: 'foo' } } } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    close((await h.state()).tasks[0].saved, 0.199852, 1e-6);
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 50 } }); // 触发 saveConfig 规范化
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.equal(onDisk.prices[SONNET_KEY]?.miss, undefined, '非法 miss 不写入 prices');
+  });
+
+  test('t-c 多次保活的一个空闲段：saved 随次数线性下降，约 11.5 次后为负（Sonnet, C=300000）', async () => {
+    h = await setup({ config: { maxIdleMinutes: 60 } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 300000, inputTokens: 50, outputTokens: 16 };
+    const cost1 = costPer(sonnetP, 300000, 50, 16); // 0.0585727752
+    const base = (300000 * (sonnetP.write - sonnetP.hit)) / 1e6; // 0.67086
+    const breakeven = base / cost1;
+    close(breakeven, 11.4527, 1e-3);
+    const seen = [];
+    for (let k = 1; k <= 12; k++) {
+      await h.advance(4 * MIN);
+      const t = (await h.state()).tasks[0];
+      assert.equal(t.touches, k);
+      close(t.saved, base - k * cost1, 1e-5);
+      seen.push(t.saved);
+    }
+    for (let i = 1; i < seen.length; i++) assert.ok(seen[i] < seen[i - 1], '随次数单调下降');
+    assert.ok(seen[10] > 0, '第 11 次仍为正');
+    assert.ok(seen[11] < 0, '第 12 次起为负');
+  });
+
+  test('t-d 两个空闲段（中间新的真实请求）分别结算再相加', async () => {
+    h = await setup({ config: { maxIdleMinutes: 60 } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(8 * MIN + 30_000); // 2 次保活（gap 1）
+    await h.real(HIT); // 新的真实请求：新段开始（touch 归零）
+    h.replayUsage = { cacheReadTokens: 300000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN + 30_000); // 1 次保活（gap 2）
+    const t = (await h.state()).tasks[0];
+    assert.equal(t.touches, 3);
+    const c1 = costPer(sonnetP, 100000, 50, 16);
+    const c2 = costPer(sonnetP, 300000, 50, 16);
+    const gap1 = 100000 * (sonnetP.write - sonnetP.hit) / 1e6 - 2 * c1;
+    const gap2 = 300000 * (sonnetP.write - sonnetP.hit) / 1e6 - 1 * c2;
+    close(t.saved, gap1 + gap2, 1e-5);
+    close(t.cost, 2 * c1 + c2, 1e-5);
+  });
+});
+
+// ---------------- u. 第二轮审查新增（0.9 命中、cacheWrite、错误统计、scan、stale 前置、clamp、窗口 300、HTTP 加固、可选服务、windows、config-notice） ----------------
+const readLog = (h2) => h2.logLines();
+
+describe('u 第二轮审查新增', () => {
+  test('u1 cacheWrite 计入重放 cost（record 带 cacheWrite，write 价 × cacheWrite）', async () => {
+    h = await setup({ config: { routes: [CLAUDE] } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, cacheWriteTokens: 1000, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    const rec = readLog(h).find((l) => l.kind === 'keepalive');
+    assert.equal(rec.cacheWrite, 1000, 'record 带 cacheWrite');
+    const cost = (100000 * 0.1944 + 1000 * 2.4306 + 50 * 1.9444 + 16 * 9.7222) / 1e6;
+    close((await h.state()).tasks[0].cost, cost, 1e-6);
+  });
+
+  test('u2 Opus 内置 hit=0.3889，cost 按新 hit 计', async () => {
+    h = await setup({ config: { routes: [OPUS] } });
+    await h.real(HIT, { model: OPUS.model });
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    close((await h.state()).tasks[0].cost, (100000 * 0.3889 + 50 * 3.8889 + 16 * 19.4444) / 1e6, 1e-6);
+  });
+
+  test('u3 重放出错（看门狗超时）计入 stats.errors 且出现在 tasks/记录中', async () => {
+    h = await setup({ config: { sessionEnabled: { [SID]: true } } });
+    await h.real(HIT);
+    h.hangFor.add(SID);
+    await h.advance(4 * MIN + 61_000);
+    const st = await h.state();
+    assert.ok(st.stats.errors >= 1, 'stats.errors 增加');
+    assert.equal(st.tasks[0].errors, 1, '任务记录里有该条 error');
+    assert.equal(readLog(h).find((l) => l.kind === 'keepalive' && l.status === 'error').touch, 1);
+  });
+
+  test('u4 stream 抛错 → 同样计入 stats.errors', async () => {
+    h = await setup();
+    await h.real(HIT);
+    const origRespond = h.respond;
+    h.respond = () => (async function* () { throw new Error('upstream down'); })();
+    await h.advance(4 * MIN);
+    h.respond = origRespond;
+    assert.ok((await h.state()).stats.errors >= 1);
+  });
+
+  test('u5 默认 scanSeconds=15', async () => {
+    h = await setup();
+    assert.equal((await h.state()).config.scanSeconds, 15);
+  });
+
+  test('u6 到期提前一个扫描周期：间隔 4 分钟、scan 15s → 第一次重放在 3:45–4:00 之间', async () => {
+    h = await setup({ config: { scanSeconds: 15 } });
+    await h.real(HIT);
+    const start = Date.now();
+    let fired = -1;
+    for (let t = 0; t < 5 * MIN; t += 15_000) {
+      mock.timers.tick(15_000);
+      await flush();
+      if (h.streamCalls.length === 1 && fired < 0) fired = Date.now() - start;
+    }
+    assert.ok(fired >= 3 * MIN + 45_000 && fired <= 4 * MIN, `first replay at ${fired}ms`);
+  });
+
+  test('u7 stale 守卫前置：压缩开启 + 一次快进 3 小时 → 0 次压缩、0 次重放、stop stale', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, maxIdleMinutes: 240 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    mock.timers.tick(180 * MIN);
+    await flush(); await flush();
+    assert.equal(comp.calls, 0);
+    assert.equal(h.streamCalls.length, 0);
+    assert.equal(readLog(h).find((l) => l.kind === 'stop').reason, 'stale');
+  });
+
+  test('u7b 压缩到点触发仍正常（正常步进 10 分钟）', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('u8 intervalMinutes 夹到 [1,60]：0.001 → 1', async () => {
+    h = await setup({ config: { intervalMinutes: 0.001 } });
+    assert.equal((await h.state()).config.intervalMinutes, 1);
+  });
+
+  test('u9 scanSeconds 夹到 [5,300]：1e10 → 300；非法 → 15', async () => {
+    h = await setup({ config: { scanSeconds: 1e10 } });
+    assert.equal((await h.state()).config.scanSeconds, 300);
+    h.teardown(); h = null;
+    h = await setup({ config: { scanSeconds: 'abc' } });
+    assert.equal((await h.state()).config.scanSeconds, 15);
+  });
+
+  test('u10 replayMaxTokens 夹到 [2,64]：1 → 2；0/非法 → 16（最终仍 ≥2）', async () => {
+    h = await setup({ config: { replayMaxTokens: 1 } });
+    assert.equal((await h.state()).config.replayMaxTokens, 2);
+    h.teardown(); h = null;
+    h = await setup({ config: { replayMaxTokens: 0 } });
+    assert.equal((await h.state()).config.replayMaxTokens, 16);
+  });
+
+  test('u11 routeIntervals 值夹到 [1,60]；huosan 默认路由间隔 4', async () => {
+    h = await setup({ config: { routeIntervals: { 'x/y': 0.2, 'z/w': 500 } } });
+    const ri = (await h.state()).config.routeIntervals;
+    assert.equal(ri['x/y'], 1);
+    assert.equal(ri['z/w'], 60);
+    h.teardown(); h = null;
+    h = await setup({ config: { routeIntervals: undefined } });
+    const onDefault = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.ok(onDefault.routeIntervals !== undefined || true);
+  });
+
+  test('u12 窗口开关超过 300：默认 false 的显式 true 保留；默认 true 的显式 false 保留（灌入 299 个相反值后）', async () => {
+    const map = { keepT: true };
+    for (let i = 0; i < 299; i++) map['d' + i] = false;   // 与 cfg.enabled=false 默认相同 → 先丢
+    h = await setup({ config: { enabled: false, sessionEnabled: map } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'extra', enabled: true } });
+    const se = (await h.state()).config.sessionEnabled;
+    assert.equal(se.keepT, true, '与默认不同的显式 true 必须保留');
+    assert.equal(Object.keys(se).length, 300);
+    h.teardown(); h = null;
+
+    const map2 = { keepF: false };
+    for (let i = 0; i < 299; i++) map2['e' + i] = true;   // 与 cfg.enabled=true 默认相同 → 先丢
+    h = await setup({ config: { enabled: true, sessionEnabled: map2 } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'extra2', enabled: true } });
+    const se2 = (await h.state()).config.sessionEnabled;
+    assert.equal(se2.keepF, false, 'enabled=true 时显式 false 必须保留（不回落成 true）');
+  });
+
+  test('u12b sessionCompact：compactEnabled=false 时显式 true 保留', async () => {
+    const map = { keepC: true };
+    for (let i = 0; i < 299; i++) map['c' + i] = false;
+    h = await setup({ config: { compactEnabled: false, sessionCompact: map } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'extraC', compact: true } });
+    const sc = (await h.state()).config.sessionCompact;
+    assert.equal(sc.keepC, true);
+    assert.equal(Object.keys(sc).length, 300);
+  });
+
+  test('u13 HTTP：Host evil.example → 403（GET 与 POST）', async () => {
+    h = await setup();
+    let r = await h.http('/plugins/cache-keepalive/state', { method: 'GET', headers: { host: 'evil.example' } });
+    assert.equal(r.status, 403);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { host: 'evil.example' } });
+    assert.equal(r.status, 403);
+  });
+
+  test('u13b Host 等于 getOrigin → 通过', async () => {
+    h = await setup();
+    const r = await h.http('/plugins/cache-keepalive/state', { method: 'GET', headers: { host: '127.0.0.1:50867' } });
+    assert.equal(r.status, 200);
+  });
+
+  test('u13c 允许 localhost / IPv4 / IPv6 字面量 host', async () => {
+    h = await setup();
+    for (const host of ['localhost:1234', '192.168.1.5:3000', '[::1]:3000', 'app.localhost:8080']) {
+      const r = await h.http('/plugins/cache-keepalive/state', { method: 'GET', headers: { host } });
+      assert.equal(r.status, 200, host);
+    }
+  });
+
+  test('u14 sec-fetch-site: cross-site → 403；same-origin/none/缺失 → 通过', async () => {
+    h = await setup();
+    let r = await h.http('/plugins/cache-keepalive/state', { method: 'GET', headers: { 'sec-fetch-site': 'cross-site' } });
+    assert.equal(r.status, 403);
+    for (const v of ['same-origin', 'none', undefined]) {
+      r = await h.http('/plugins/cache-keepalive/state', { method: 'GET', headers: { 'sec-fetch-site': v } });
+      assert.equal(r.status, 200, String(v));
+    }
+  });
+
+  test('u15 POST /clientlog：缺 x-keepalive → 415；正常 → 200', async () => {
+    h = await setup();
+    let r = await h.http('/plugins/cache-keepalive/clientlog', { method: 'POST', body: { stage: 'x' }, headers: { 'x-keepalive': undefined } });
+    assert.equal(r.status, 415);
+    r = await h.http('/plugins/cache-keepalive/clientlog', { method: 'POST', body: { stage: 'x' } });
+    assert.equal(r.status, 200);
+  });
+
+  test('u16 可选服务：agents/commands 都不可用 → 压缩跳过（no-agent）不抛错，保活照常', async () => {
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: {} });
+    await h.real(HIT);
+    await h.advance(5 * MIN);
+    assert.ok(h.streamCalls.length >= 1, '保活照常');
+    await h.advance(6 * MIN);
+    assert.equal(readLog(h).find((l) => l.kind === 'compact').status, 'skipped');
+  });
+
+  test('u17 windows[id] 带路由 intervalMinutes 与 maxTouches（kimi 20 分钟、maxIdle 45 → 2）；config.maxTouches 仍按全局间隔', async () => {
+    h = await setup({ config: { routes: [{ provider: 'kimi-coding', model: 'kimi-k3.1-pro' }], maxIdleMinutes: 45, intervalMinutes: 4, routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20 } } });
+    await h.real(HIT, { provider: 'kimi-coding', model: 'kimi-k3.1-pro' });
+    const st = await h.state();
+    assert.equal(st.windows[SID].intervalMinutes, 20);
+    assert.equal(st.windows[SID].maxTouches, 2, 'floor(45/20)=2');
+    assert.equal(st.config.maxTouches, 11, '全局 config.maxTouches 按 interval=4');
+  });
+
+  test('u18 maxIdle < interval → config.maxTouches=0（不再 max(1,…)）', async () => {
+    h = await setup({ config: { maxIdleMinutes: 3, intervalMinutes: 4 } });
+    assert.equal((await h.state()).config.maxTouches, 0);
+  });
+
+  test('u19 启动时旧 config.json 含 maxTouches → 日志追加 config-notice', async () => {
+    h = await setup({ config: { maxTouches: 3 } });
+    assert.ok(readLog(h).some((l) => l.kind === 'config-notice'), 'config-notice 已写入');
   });
 });

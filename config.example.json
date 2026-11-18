@@ -2,7 +2,7 @@
   "enabled": false,
   "sessionEnabled": {},
   "intervalMinutes": 4,
-  "maxIdleMinutes": 60,
+  "maxIdleMinutes": 45,
   "compactAfterMinutes": 20,
   "replayMaxTokens": 16,
   "scanSeconds": 15,
@@ -19,7 +19,7 @@
   ],
   "routeIntervals": {
     "kimi-coding/kimi-k3.1-pro": 20,
-    "huosan/kimi-k3.1-pro": 5
+    "huosan/kimi-k3.1-pro": 4
   },
   "prices": {},
   "requireProvenCache": true,

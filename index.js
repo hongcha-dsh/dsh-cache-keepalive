@@ -35,7 +35,7 @@ const DEFAULTS = {
   sessionEnabled: {},
   /** Must stay below the route's cache TTL; Claude's is 5 min, so 4 is the safe default. */
   intervalMinutes: 4,
-  maxIdleMinutes: 60,
+  maxIdleMinutes: 45,
   /** Idle minutes (5-120) before a compaction-enabled window is compacted once, after which keep-alive stops for it. */
   compactAfterMinutes: 20,
   /** Default for a window that never chose explicitly. Off: compaction is always opt-in per window. */
@@ -45,12 +45,12 @@ const DEFAULTS = {
   /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
   prices: {},
   replayMaxTokens: 16,
-  scanSeconds: 30,
+  scanSeconds: 15,
   maxSessions: 3,
   /** Empty list = follow whatever model the conversation is using. */
   routes: [],
   /** Optional per-route interval override, keyed "provider/model". */
-  routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20, 'huosan/kimi-k3.1-pro': 5 },
+  routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20, 'huosan/kimi-k3.1-pro': 4 },
   /** Arm a route only after a real request on it reported cacheRead > 0. */
   requireProvenCache: true
 };
@@ -64,7 +64,7 @@ function normalizeConfig(raw) {
   if (cfg.routeIntervals && typeof cfg.routeIntervals === 'object') {
     for (const [key, value] of Object.entries(cfg.routeIntervals)) {
       const minutes = Number(value);
-      if (typeof key === 'string' && Number.isFinite(minutes) && minutes > 0) intervals[key] = minutes;
+      if (typeof key === 'string' && Number.isFinite(minutes) && minutes > 0) intervals[key] = Math.min(Math.max(minutes, 1), 60);
     }
   }
   cfg.routeIntervals = intervals;
@@ -80,11 +80,13 @@ function normalizeConfig(raw) {
   if (!Number.isFinite(cfg.maxIdleMinutes) || cfg.maxIdleMinutes <= 0) cfg.maxIdleMinutes = DEFAULTS.maxIdleMinutes;
   // Legacy key: the touch count is now derived from maxIdleMinutes / intervalMinutes, never configured.
   delete cfg.maxTouches;
-  cfg.intervalMinutes = Math.min(cfg.intervalMinutes, 60);
+  cfg.intervalMinutes = Math.min(Math.max(cfg.intervalMinutes, 1), 60);
   cfg.maxIdleMinutes = Math.min(cfg.maxIdleMinutes, 1440);
   if (!Number.isFinite(cfg.replayMaxTokens) || cfg.replayMaxTokens < 1) cfg.replayMaxTokens = DEFAULTS.replayMaxTokens;
-  cfg.replayMaxTokens = Math.min(Math.floor(cfg.replayMaxTokens), 64);
+  // >= 2: a relay may short-circuit max_tokens=1 without touching the cache.
+  cfg.replayMaxTokens = Math.min(Math.max(Math.floor(cfg.replayMaxTokens), 2), 64);
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
+  cfg.scanSeconds = Math.min(cfg.scanSeconds, 300);
   if (!Number.isFinite(cfg.maxSessions) || cfg.maxSessions < 1) cfg.maxSessions = DEFAULTS.maxSessions;
   cfg.maxSessions = Math.min(Math.floor(cfg.maxSessions), 10);
   const compact = Number(cfg.compactAfterMinutes);
@@ -101,7 +103,7 @@ function normalizeConfig(raw) {
   if (cfg.prices && typeof cfg.prices === 'object' && !Array.isArray(cfg.prices)) {
     for (const [key, value] of Object.entries(cfg.prices)) {
       if (value && [value.hit, value.input, value.output, value.write].every((n) => Number.isFinite(Number(n)) && Number(n) >= 0)) {
-        prices[key] = { hit: Number(value.hit), input: Number(value.input), output: Number(value.output), write: Number(value.write) };
+        prices[key] = { hit: Number(value.hit), input: Number(value.input), output: Number(value.output), write: Number(value.write), ...(value.miss === 'input+write' ? { miss: 'input+write' } : {}) };
       }
     }
   }
@@ -144,13 +146,13 @@ function appendLog(record) {
 /** A replay is a tiny request; anything slower than this is hung, and must not hold the lock. */
 const REPLAY_TIMEOUT_MS = 60_000;
 /** Share of the replayed prompt that must come from cache to count as a hit. */
-const HIT_RATIO = 0.6;
+const HIT_RATIO = 0.9;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
 const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
 
 export const name = 'cache-keepalive';
-export const inject = ['llm', 'sessions', 'agents', 'commands'];
+export const inject = ['llm', 'sessions'];
 
 export function apply(ctx) {
   let cfg = loadConfig() ?? normalizeConfig(DEFAULTS);
@@ -196,10 +198,12 @@ export function apply(ctx) {
    * A route with no entry here is costed at 0 and reports no savings.
    */
   const DEFAULT_PRICES = {
-    'kimi-coding/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13 },
-    'huosan/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13 },
+    // miss: 'input+write' = this vendor bills an expired prefix at the input price AND a cache write (kimi's official billing).
+    // The default (omitted) is Anthropic-style: an expired prefix is billed once, at the cache-write price.
+    'kimi-coding/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13, miss: 'input+write' },
+    'huosan/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13, miss: 'input+write' },
     'blsc-anthropic/Claude-Sonnet-5.5': { hit: 0.1944, input: 1.9444, output: 9.7222, write: 2.4306 },
-    'blsc-anthropic/Claude-Opus-5.5': { hit: 0.1944, input: 3.8889, output: 19.4444, write: 4.8611 }
+    'blsc-anthropic/Claude-Opus-5.5': { hit: 0.3889, input: 3.8889, output: 19.4444, write: 4.8611 }
   };
   const NO_PRICE = { hit: 0, input: 0, output: 0, write: 0 };
   function priceFor(provider, model) {
@@ -208,7 +212,7 @@ export function apply(ctx) {
   }
   function priceOf(record) {
     const price = priceFor(record.provider, record.model);
-    return ((record.cacheRead ?? 0) * price.hit + (record.input ?? 0) * price.input + (record.output ?? 0) * price.output) / 1e6;
+    return ((record.cacheRead ?? 0) * price.hit + (record.cacheWrite ?? 0) * price.write + (record.input ?? 0) * price.input + (record.output ?? 0) * price.output) / 1e6;
   }
   function remember(record) {
     history.push(record);
@@ -282,6 +286,21 @@ export function apply(ctx) {
       routeStats.set(key, state);
     }
     return state;
+  }
+
+  /** `agents` / `commands` are only needed for compaction: fetched lazily so the keep-alive part works without them. */
+  function optionalService(name) {
+    try {
+      const service = ctx.get(name);
+      if (service !== undefined && service !== null) return service;
+    } catch {
+      /* not mounted */
+    }
+    try {
+      return ctx[name];
+    } catch {
+      return undefined;
+    }
   }
 
   function sessionsService() {
@@ -364,24 +383,28 @@ export function apply(ctx) {
     if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
     return cfg.enabled === true;
   }
-  /** Insert/overwrite a switch at the tail; past 300 entries drop `false` ones first (oldest first), never an active `true` while a `false` exists. */
-  function withSwitch(source, sessionId, value) {
+  /**
+   * Insert/overwrite a switch at the tail. Past 300 entries drop the ones that merely repeat the
+   * default first (they change nothing), oldest first; only then the oldest remaining entry.
+   */
+  function withSwitch(source, sessionId, value, defaultValue) {
     const map = { ...(source && typeof source === 'object' ? source : {}) };
     delete map[sessionId];
     map[sessionId] = value === true;
-    let keys = Object.keys(map);
-    if (keys.length > 300) {
-      for (const key of keys.filter((k) => map[k] !== true && k !== sessionId)) {
+    if (Object.keys(map).length > 300) {
+      for (const key of Object.keys(map)) {
         if (Object.keys(map).length <= 300) break;
-        delete map[key];
+        if (key !== sessionId && map[key] === (defaultValue === true)) delete map[key];
       }
-      keys = Object.keys(map);
-      for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
+      for (const key of Object.keys(map)) {
+        if (Object.keys(map).length <= 300) break;
+        if (key !== sessionId) delete map[key];
+      }
     }
     return map;
   }
   function setSessionEnabledOf(sessionId, enabled) {
-    cfg = saveConfig({ ...cfg, sessionEnabled: withSwitch(cfg.sessionEnabled, sessionId, enabled) });
+    cfg = saveConfig({ ...cfg, sessionEnabled: withSwitch(cfg.sessionEnabled, sessionId, enabled, cfg.enabled) });
     // Turning a window on starts a fresh "本次开启" epoch; turning it off drops it.
     if (enabled === true) enabledSince.set(sessionId, Date.now());
     else enabledSince.delete(sessionId);
@@ -396,7 +419,7 @@ export function apply(ctx) {
     return cfg.compactEnabled === true;
   }
   function setSessionCompactOf(sessionId, enabled) {
-    cfg = saveConfig({ ...cfg, sessionCompact: withSwitch(cfg.sessionCompact, sessionId, enabled) });
+    cfg = saveConfig({ ...cfg, sessionCompact: withSwitch(cfg.sessionCompact, sessionId, enabled, cfg.compactEnabled) });
     appendLog({ kind: 'compact-switch', session: sessionId, enabled: enabled === true });
   }
 
@@ -407,12 +430,12 @@ export function apply(ctx) {
   }
 
   /**
-   * Net saving of one idle gap. A cold re-prefill costs C tokens at the input
-   * price PLUS a C-token 5m cache write (official billing counts both), i.e.
-   * (input + write) per token; keeping the cache warm costs `touches` cache
-   * reads at the hit price. So net = C * hit * (R - touches), R = (input+write)/hit
-   * = 20 for kimi-k3.1-pro (22.5 for the Claude route). A gap whose only outcomes were misses/errors saved
-   * nothing and cost cash.
+   * Net saving of one idle gap that ended in a real request. Had the cache expired, the
+   * next request would have paid `coldPerM` (Anthropic-style: one cache write; kimi:
+   * input + write) instead of the live-cache read `hit`, i.e. it avoids C * (cold - hit).
+   * Keeping the cache warm cost the replays themselves (reads + their tiny output), summed
+   * in gap.cost. net = C * (cold - hit) - gap.cost. A gap whose only outcomes were
+   * misses/errors saved nothing and cost cash.
    */
   function summarizeSession(records) {
     const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
@@ -446,9 +469,11 @@ export function apply(ctx) {
     }
     for (const gap of gaps) {
       const price = priceFor(gap.provider, gap.model);
-      const ratio = price.hit > 0 ? (price.input + price.write) / price.hit : 0;
+      // What the NEXT real request would have cost, per 1M tokens, had the cache expired, minus what it costs on a live cache.
+      const coldPerM = price.miss === 'input+write' ? price.input + price.write : price.write;
+      const avoidedPerM = Math.max(0, coldPerM - price.hit);
       summary.saved += gap.hit
-        ? (gap.cache * Math.max(0, ratio - gap.touches) * price.hit) / 1e6
+        ? (gap.cache * avoidedPerM) / 1e6 - gap.cost
         : -gap.cost;
     }
     summary.cost = +summary.cost.toFixed(6);
@@ -513,6 +538,7 @@ export function apply(ctx) {
         ...summarizeSession(kept),
         lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
         gapTouches: entry === undefined ? 0 : entry.touches,
+        ...routeLimits(sessionId, entry),
         stopped: entry === undefined ? false : entry.stopped,
         idleMinutes: entry === undefined ? null : +((Date.now() - entry.lastRealAt) / 60000).toFixed(1),
         nextDueSeconds: entry === undefined ? null : Math.max(0, Math.round((entry.nextDueAt - Date.now()) / 1000))
@@ -699,7 +725,9 @@ export function apply(ctx) {
       const tokens = typeof result.shadowedTokenCount === 'number' ? result.shadowedTokenCount : 0;
       return { via: 'service', kind: 'success', text: 'compacted ~' + tokens + ' tokens' };
     }
-    const execution = await ctx.commands.execute(agent, '/compact', [], signal);
+    const commands = optionalService('commands');
+    if (commands === undefined || typeof commands.execute !== 'function') return { via: 'command', kind: 'missing', text: 'no command service' };
+    const execution = await commands.execute(agent, '/compact', [], signal);
     if (execution === undefined) return { via: 'command', kind: 'missing', text: 'no /compact command in this session' };
     const result = execution.result ?? {};
     return { via: 'command', kind: result.kind ?? 'unknown', text: result.text ?? '' };
@@ -722,7 +750,7 @@ export function apply(ctx) {
    * slow compaction never delays other sessions' keep-alive.
    */
   function startCompaction(sessionId, entry) {
-    const agent = ctx.agents.get(sessionId);
+    const agent = optionalService('agents')?.get?.(sessionId);
     if (agent === undefined) {
       entry.stopped = true;
       appendLog({ kind: 'compact', session: sessionId, status: 'skipped', reason: 'no-agent' });
@@ -755,6 +783,18 @@ export function apply(ctx) {
     if (busy) return;
     if (entry.stopped) return;
     const compactOn = compactEnabledOf(sessionId);
+    // The cache is refreshed from the START of the last request. If we are already well past the replay
+    // interval (machine slept, clock jumped, queue backed up) it has probably expired, and a replay or a
+    // compaction (which reads the whole context) would only pay for a cold rewrite. Stop instead.
+    const nowMs = Date.now();
+    if (entry.snapshot !== undefined && !inflight.has(sessionId)) {
+      const sinceTouch = nowMs - (entry.lastTouchAt ?? entry.lastRealAt);
+      if (sinceTouch > intervalFor(entry.snapshot.provider, entry.snapshot.model) * 1.25) {
+        entry.stopped = true;
+        appendLog({ kind: 'stop', session: sessionId, reason: 'stale', sinceTouchMinutes: +(sinceTouch / 60000).toFixed(1) });
+        return;
+      }
+    }
     if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && startCompaction(sessionId, entry)) return;
     const now = Date.now();
     // With compaction on, the idle cap must leave room for the compaction to happen first.
@@ -764,18 +804,9 @@ export function apply(ctx) {
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-idle', idleMinutes: +((now - entry.lastRealAt) / 60000).toFixed(1) });
       return;
     }
-    if (now < entry.nextDueAt) return;
+    if (now + cfg.scanSeconds * 1000 < entry.nextDueAt) return;
     if (inflight.has(sessionId)) return;
     if (entry.snapshot === undefined) return;
-    // The cache is refreshed from the START of the last request; if we are already well past
-    // the replay interval (machine slept, clock jumped, queue backed up) it has probably expired
-    // and a replay would only pay for a full rewrite. Stop instead of spending.
-    const sinceTouch = now - (entry.lastTouchAt ?? entry.lastRealAt);
-    if (sinceTouch > intervalFor(entry.snapshot.provider, entry.snapshot.model) * 1.25) {
-      entry.stopped = true;
-      appendLog({ kind: 'stop', session: sessionId, reason: 'stale', sinceTouchMinutes: +(sinceTouch / 60000).toFixed(1) });
-      return;
-    }
     if (cfg.requireProvenCache !== false && !routeState(entry.snapshot.provider, entry.snapshot.model).proven) {
       // No real request on this route has shown a cache hit yet: don't spend on it.
       return;
@@ -808,7 +839,10 @@ export function apply(ctx) {
     } catch (error) {
       busy = false;
       if ((entry.gen ?? 0) === gen) entry.stopped = true;
-      appendLog({ kind: 'keepalive', session: sessionId, title, provider: snapshot.provider, model: snapshot.model, touch, status: 'error', error: String(error?.message ?? error) });
+      const errorRecord = { ts: new Date().toISOString(), kind: 'keepalive', session: sessionId, title, provider: snapshot.provider, model: snapshot.model, touch, status: 'error', error: String(error?.message ?? error) };
+      appendLog(errorRecord);
+      remember(errorRecord);
+      addToStats(errorRecord);
       return;
     } finally {
       clearTimeout(watchdog);
@@ -824,8 +858,9 @@ export function apply(ctx) {
     // uncached/rewritten remainder means the replay diverged from the real request: that is a
     // miss, and repeating it would rewrite the prefix every interval.
     const promptTokens = (cacheRead ?? 0) + (input ?? 0) + cacheWrite;
+    // The adapter omits a zero cacheRead entirely, so "no cache field but a prompt was billed" is a miss, not "unknown".
     const status = failed ? 'error'
-      : cacheRead === null ? 'unknown'
+      : cacheRead === null ? ((input ?? 0) + cacheWrite > 0 ? 'miss' : 'unknown')
         : cacheRead > 0 && promptTokens > 0 && cacheRead / promptTokens >= HIT_RATIO ? 'hit' : 'miss';
     const record = {
       ts: new Date().toISOString(),
@@ -839,6 +874,7 @@ export function apply(ctx) {
       cacheRead,
       input,
       output,
+      ...(cacheWrite > 0 ? { cacheWrite } : {}),
       finish: finishReason,
       ms: Date.now() - startedAt
     };
@@ -896,6 +932,14 @@ export function apply(ctx) {
     return observe(raw, sessionId);
   });
 
+  /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
+  function routeLimits(sessionId, entry) {
+    const snapshot = entry?.snapshot;
+    const intervalMs = snapshot === undefined ? cfg.intervalMinutes * 60_000 : intervalFor(snapshot.provider, snapshot.model);
+    const idleCap = compactEnabledOf(sessionId) ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
+    return { intervalMinutes: +(intervalMs / 60000).toFixed(1), maxTouches: Math.floor((idleCap * 60_000) / intervalMs) };
+  }
+
   function stateSnapshot() {
     const tasks = buildTasks();
     const saved = tasks.reduce((sum, task) => sum + task.saved, 0);
@@ -910,7 +954,7 @@ export function apply(ctx) {
         intervalMinutes: cfg.intervalMinutes,
         maxIdleMinutes: cfg.maxIdleMinutes,
         /** Derived, read-only: how many keep-alives fit in the idle cap at the configured interval. */
-        maxTouches: Math.max(1, Math.floor(cfg.maxIdleMinutes / cfg.intervalMinutes)),
+        maxTouches: Math.floor(cfg.maxIdleMinutes / cfg.intervalMinutes),
         replayMaxTokens: cfg.replayMaxTokens,
         compactAfterMinutes: cfg.compactAfterMinutes,
         compactEnabled: cfg.compactEnabled,
@@ -972,6 +1016,33 @@ export function apply(ctx) {
      * preflight. Require what a cross-site form/no-cors fetch cannot send: a JSON content type
      * plus our own header (both force a preflight we never answer), and a same-origin Origin.
      */
+    const header = (req, name) => String(req.headers?.[name] ?? '');
+    /** Host names a DNS-rebinding page cannot own: localhost, IP literals, or this server's own advertised origin. */
+    const hostAllowed = (req, webServer) => {
+      const raw = header(req, 'host');
+      if (raw === '') return false;
+      const name = (raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.replace(/:\d+$/, '')).toLowerCase();
+      if (name === 'localhost' || name.endsWith('.localhost')) return true;
+      if (name.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(name)) return true;
+      try {
+        return new URL(webServer.getOrigin()).host.toLowerCase() === raw.toLowerCase();
+      } catch {
+        return false;
+      }
+    };
+    /** Every route: right Host, and never a cross-site fetch (a browser labels those itself). */
+    const guardRequest = (req, res, webServer) => {
+      if (!hostAllowed(req, webServer)) {
+        send(res, 403, { error: 'host not allowed' });
+        return false;
+      }
+      const site = header(req, 'sec-fetch-site');
+      if (site !== '' && site !== 'same-origin' && site !== 'none') {
+        send(res, 403, { error: 'cross-site request rejected' });
+        return false;
+      }
+      return true;
+    };
     const guardPost = (req, res) => {
       const header = (name) => String(req.headers?.[name] ?? '');
       const origin = header('origin');
@@ -1002,7 +1073,13 @@ export function apply(ctx) {
       return body;
     };
     const installRoutes = (webCtx) => {
-      const webServer = webCtx.webServer;
+      const rawWebServer = webCtx.webServer;
+      const webServer = {
+        register: (route) => rawWebServer.register({
+          ...route,
+          handler: (req, res) => (guardRequest(req, res, rawWebServer) ? route.handler(req, res) : undefined)
+        })
+      };
       webCtx.effect(function* statusRoutes() {
         const offState = webServer.register({
         kind: 'exact',
@@ -1081,6 +1158,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const entry = JSON.parse(body || '{}');
@@ -1206,6 +1284,13 @@ export function apply(ctx) {
   registerStatusRoutes();
 
   ctx.effect(function* keepaliveLifecycle() {
+    try {
+      if (Object.prototype.hasOwnProperty.call(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')), 'maxTouches')) {
+        appendLog({ kind: 'config-notice', notice: 'maxTouches is no longer a setting: the keep-alive count is now derived from maxIdleMinutes / interval' });
+      }
+    } catch {
+      /* no config yet, or unreadable: nothing to report */
+    }
     appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
     const timer = setInterval(() => {
       tick().catch((error) => {
