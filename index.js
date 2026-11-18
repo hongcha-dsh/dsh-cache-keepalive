@@ -40,6 +40,8 @@ const DEFAULTS = {
   compactAfterMinutes: 20,
   /** Default for a window that never chose explicitly. Off: compaction is always opt-in per window. */
   compactEnabled: false,
+  /** A manual compaction (the user's /compact) clears that window's auto-compaction countdown: the obsolete snapshot is dropped and keep-alive/compaction wait for the next real request. */
+  compactResetOnManual: true,
   /** sessionId -> boolean: the per-window compaction switch (needs that window's keep-alive on). */
   sessionCompact: {},
   /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
@@ -92,6 +94,7 @@ function normalizeConfig(raw) {
   const compact = Number(cfg.compactAfterMinutes);
   cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : DEFAULTS.compactAfterMinutes;
   cfg.compactEnabled = cfg.compactEnabled === true;
+  cfg.compactResetOnManual = cfg.compactResetOnManual !== false;
   const perSessionCompact = {};
   if (cfg.sessionCompact && typeof cfg.sessionCompact === 'object' && !Array.isArray(cfg.sessionCompact)) {
     for (const [sessionId, value] of Object.entries(cfg.sessionCompact)) {
@@ -149,7 +152,7 @@ const REPLAY_TIMEOUT_MS = 60_000;
 const HIT_RATIO = 0.9;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
-const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
 
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions'];
@@ -161,11 +164,20 @@ export function apply(ctx) {
   /** replay option objects created by this plugin: never captured, never observed. */
   const replaying = new WeakSet();
   /** sessionIds with a real model stream in flight. */
+  /**
+   * Real streams in flight, per session AND route. A stream on a different route (a persona rewrite, a
+   * title call...) does not touch the replayed prefix's cache, so it must not hold the replay back.
+   */
   const inflightCounts = new Map();
   const inflight = {
-    add(id) { inflightCounts.set(id, (inflightCounts.get(id) ?? 0) + 1); },
-    delete(id) { const n = (inflightCounts.get(id) ?? 0) - 1; if (n > 0) inflightCounts.set(id, n); else inflightCounts.delete(id); },
-    has(id) { return (inflightCounts.get(id) ?? 0) > 0; }
+    add(id, route = '') { const k = id + '|' + route; inflightCounts.set(k, (inflightCounts.get(k) ?? 0) + 1); },
+    delete(id, route = '') { const k = id + '|' + route; const n = (inflightCounts.get(k) ?? 0) - 1; if (n > 0) inflightCounts.set(k, n); else inflightCounts.delete(k); },
+    /** `route` omitted: any route of this session. */
+    has(id, route) {
+      if (route !== undefined) return (inflightCounts.get(id + '|' + route) ?? 0) > 0;
+      for (const [k, n] of inflightCounts) if (n > 0 && k.startsWith(id + '|')) return true;
+      return false;
+    }
   };
   /** Sessions with a compaction running (compaction runs outside the global replay lock). */
   const compacting = new Set();
@@ -539,6 +551,7 @@ export function apply(ctx) {
         lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
         gapTouches: entry === undefined ? 0 : entry.touches,
         ...routeLimits(sessionId, entry),
+        ...compactionInfo(sessionId, entry),
         stopped: entry === undefined ? false : entry.stopped,
         idleMinutes: entry === undefined ? null : +((Date.now() - entry.lastRealAt) / 60000).toFixed(1),
         nextDueSeconds: entry === undefined ? null : Math.max(0, Math.round((entry.nextDueAt - Date.now()) / 1000))
@@ -667,17 +680,18 @@ export function apply(ctx) {
       existing.nextDueAt = now + intervalFor(options.provider, options.model);
       existing.stopped = false;
       existing.gen = (existing.gen ?? 0) + 1;
+      existing.deferLogged = false;
       existing.lastTouchAt = now;
       if (title !== null && title.length > 0) existing.title = title;
     }
     prune();
   }
 
-  function observe(iterable, sessionId) {
+  function observe(iterable, sessionId, route) {
     return (async function* observeStream() {
       // Marked in-flight only once iteration starts, so a stream that is closed
       // before its first pull can never leave the session stuck as in-flight.
-      inflight.add(sessionId);
+      inflight.add(sessionId, route);
       try {
         for await (const chunk of iterable) {
           try {
@@ -699,7 +713,7 @@ export function apply(ctx) {
           yield chunk;
         }
       } finally {
-        inflight.delete(sessionId);
+        inflight.delete(sessionId, route);
       }
     })();
   }
@@ -764,8 +778,10 @@ export function apply(ctx) {
     void (async () => {
       try {
         const result = await Promise.race([runCompaction(agent, signal), abortRace(signal, 'compaction timed out')]);
+        entry.lastCompaction = { at: Date.now(), kind: 'auto', status: result.kind };
         appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: result.kind, via: result.via, text: result.text, idleMinutes, touches: entry.touches });
       } catch (error) {
+        entry.lastCompaction = { at: Date.now(), kind: 'auto', status: 'error' };
         appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'error', error: String(error?.message ?? error), idleMinutes, touches: entry.touches });
       } finally {
         compacting.delete(sessionId);
@@ -774,20 +790,30 @@ export function apply(ctx) {
     return true;
   }
 
+  /** Why a due replay did not run: logged once per idle gap, and only when it is already 30 s overdue. */
+  function noteDeferred(sessionId, entry, reason, now) {
+    if (entry.deferLogged === true || now < entry.nextDueAt + 30_000) return;
+    entry.deferLogged = true;
+    appendLog({ kind: 'defer', session: sessionId, reason, overdueSeconds: Math.round((now - entry.nextDueAt) / 1000) });
+  }
+
   async function replay(sessionId, entry) {
     if (!sessionEnabledOf(sessionId)) {
       entry.stopped = true;
       sessions.delete(sessionId);
       return;
     }
-    if (busy) return;
+    if (busy) {
+      noteDeferred(sessionId, entry, 'another-replay-running', Date.now());
+      return;
+    }
     if (entry.stopped) return;
     const compactOn = compactEnabledOf(sessionId);
     // The cache is refreshed from the START of the last request. If we are already well past the replay
     // interval (machine slept, clock jumped, queue backed up) it has probably expired, and a replay or a
     // compaction (which reads the whole context) would only pay for a cold rewrite. Stop instead.
     const nowMs = Date.now();
-    if (entry.snapshot !== undefined && !inflight.has(sessionId)) {
+    if (entry.snapshot !== undefined && !inflight.has(sessionId, routeKeyOf(entry.snapshot.provider, entry.snapshot.model))) {
       const sinceTouch = nowMs - (entry.lastTouchAt ?? entry.lastRealAt);
       if (sinceTouch > intervalFor(entry.snapshot.provider, entry.snapshot.model) * 1.25) {
         entry.stopped = true;
@@ -805,8 +831,11 @@ export function apply(ctx) {
       return;
     }
     if (now + cfg.scanSeconds * 1000 < entry.nextDueAt) return;
-    if (inflight.has(sessionId)) return;
     if (entry.snapshot === undefined) return;
+    if (inflight.has(sessionId, routeKeyOf(entry.snapshot.provider, entry.snapshot.model))) {
+      noteDeferred(sessionId, entry, 'stream-in-flight', now);
+      return;
+    }
     if (cfg.requireProvenCache !== false && !routeState(entry.snapshot.provider, entry.snapshot.model).proven) {
       // No real request on this route has shown a cache hit yet: don't spend on it.
       return;
@@ -929,8 +958,50 @@ export function apply(ctx) {
     if (replaying.has(options)) return raw;
     // Requests that carry a purpose (compaction, titles...) are not real turns: don't track them as in-flight or learn cache proof from them.
     if (options.purpose !== undefined) return raw;
-    return observe(raw, sessionId);
+    return observe(raw, sessionId, routeKeyOf(options.provider, options.model));
   });
+
+  /**
+   * The user's own /compact (a `compaction/end` with no turn and no error) rewrites the session surface: the
+   * stored request snapshot no longer describes what the next real request will send, so replaying it would
+   * only keep an obsolete prefix warm. With `compactResetOnManual` the window's auto-compaction countdown is
+   * cleared along with it; the next real request re-arms keep-alive and starts the countdown again.
+   */
+  ctx.on('session/event', (session, event) => {
+    try {
+      if (event?.type !== 'compaction/end' || event.data?.error !== undefined || event.data?.turn !== null) return;
+      const sessionId = session?.id;
+      if (typeof sessionId !== 'string' || compacting.has(sessionId)) return;
+      const entry = sessions.get(sessionId);
+      if (entry === undefined) return;
+      entry.lastCompaction = { at: Date.now(), kind: 'manual', status: 'success' };
+      if (!cfg.compactResetOnManual) return;
+      entry.stopped = true;
+      entry.snapshot = undefined;
+      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'manual', via: 'user', text: 'manual compaction: countdown cleared, waiting for the next real request' });
+    } catch (error) {
+      ctx.logger?.warn?.('cache-keepalive: compaction event handler failed: ' + String(error?.message ?? error));
+    }
+  });
+
+  /** What the compaction half of the composer oval shows: a countdown while armed, otherwise why there is none. */
+  function compactionInfo(sessionId, entry) {
+    const on = compactEnabledOf(sessionId);
+    const minutes = cfg.compactAfterMinutes;
+    const last = entry?.lastCompaction ?? null;
+    let status;
+    let dueSeconds = null;
+    if (!on) status = 'off';
+    else if (entry === undefined) status = 'waiting';
+    else if (compacting.has(sessionId)) status = 'running';
+    else if (last !== null && entry.stopped && entry.lastRealAt <= last.at) status = last.kind === 'manual' ? 'manual' : 'done';
+    else if (entry.stopped) status = 'stopped';
+    else {
+      status = 'counting';
+      dueSeconds = Math.max(0, Math.round((entry.lastRealAt + minutes * 60_000 - Date.now()) / 1000));
+    }
+    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, lastCompaction: last };
+  }
 
   /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
   function routeLimits(sessionId, entry) {
@@ -958,6 +1029,7 @@ export function apply(ctx) {
         replayMaxTokens: cfg.replayMaxTokens,
         compactAfterMinutes: cfg.compactAfterMinutes,
         compactEnabled: cfg.compactEnabled,
+        compactResetOnManual: cfg.compactResetOnManual,
         sessionCompact: cfg.sessionCompact,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,

@@ -59,6 +59,7 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     JSON.stringify({ enabled: false, sessionEnabled: { [SID]: true }, routes: [CLAUDE], routeIntervals: {}, ...config }, null, 2)
   );
   const hooks = [];
+  const sessionEventHooks = [];
   const routes = {};
   const cleanups = [];
   const h = {
@@ -82,6 +83,8 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     req: (o = {}) => ({ sessionId: SID, provider: CLAUDE.provider, model: CLAUDE.model, messages: MSG, tools: TOOLS, toolHistory: [], maxTokens: 4096, signal: new AbortController().signal, ...o }),
     /** Non-replay stream through the llm/stream hook chain (used for compaction-purpose requests). */
     llmStream: (options) => hooks[0](options, () => h.respond(options)),
+    /** Fire ctx.on('session/event') listeners the way the host does: (session, event). */
+    emitSessionEvent: (sessionId, event) => { for (const fn of sessionEventHooks) fn({ id: sessionId }, event); },
     /** A real request: hook is called, the returned stream is NOT consumed. */
     open: (usage = HIT, o = {}) =>
       hooks[0](h.req(o), () => iter([{ type: 'usage', usage }, { type: 'finish', reason: { kind: 'stop' } }])),
@@ -148,6 +151,7 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     logger: { warn: () => {}, info: () => {}, error: () => {} },
     on(event, fn) {
       if (event === 'llm/stream') hooks.push(fn);
+      if (event === 'session/event') sessionEventHooks.push(fn);
     },
     get(name) {
       if (name === 'sessions') return { get: (id) => h.sessions[id] ?? { header: {} } };
@@ -1630,5 +1634,250 @@ describe('u 第二轮审查新增', () => {
   test('u19 启动时旧 config.json 含 maxTouches → 日志追加 config-notice', async () => {
     h = await setup({ config: { maxTouches: 3 } });
     assert.ok(readLog(h).some((l) => l.kind === 'config-notice'), 'config-notice 已写入');
+  });
+});
+
+// ---------------- v. 第三轮：按会话+路线 inflight、手动压缩检测、压缩倒计时状态 ----------------
+const COMPACT_KIMI = { provider: 'kimi-coding', model: 'kimi-k3.1-pro' };
+const manualEvt = (extra = {}) => ({ type: 'compaction/end', data: { turn: null, ...extra } });
+const compactOf = (st, id = SID) => st.windows[id];
+
+describe('v1 inflight 按会话+路线', () => {
+  test('v1a 同会话另一路线的在途流 → 不阻止快照路线重放（快照被另一路线覆盖的情形另行断言）', async () => {
+    // 真实请求会 capture 为新快照（capture 不区分路线），所以“快照路线 A、在途路线 B”要靠：
+    // B 的流先在途，之后 A 的真实请求才覆盖快照。这里验证：在途的是 B，快照是 A 时，A 的重放照常。
+    h = await setup({ config: { routes: [] } });
+    const other = h.open(HIT, { provider: COMPACT_KIMI.provider, model: COMPACT_KIMI.model })[Symbol.asyncIterator]();
+    await other.next();                                    // B 在途（无 purpose）→ 但它也会 capture 为快照
+    await h.real(HIT);                                     // A 的真实请求覆盖快照为 Sonnet（inflight 只剩 B）
+    await h.advance(4 * MIN + 30_000);
+    assert.equal(h.streamCalls.filter((o) => o.model === CLAUDE.model).length, 1, '快照路线 A 的重放不因 B 在途而推迟');
+    for await (const _ of other) { /* drain */ }
+  });
+
+  test('v1b 同路线的在途流 → 推迟重放，结束后再重放', async () => {
+    h = await setup();
+    await h.real(HIT);
+    const same = h.open(HIT)[Symbol.asyncIterator]();      // 同路线
+    await same.next();
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 0, '同路线在途 → 推迟');
+    for await (const _ of same) { /* drain */ }
+    await h.advance(30_000);
+    assert.equal(h.streamCalls.length, 1);
+  });
+
+  test('v1c 另一路线在途不影响 stale 判定（快照路线仍可按时保活）', async () => {
+    h = await setup();
+    await h.real(HIT);
+    const other = h.open(HIT, { provider: COMPACT_KIMI.provider, model: COMPACT_KIMI.model })[Symbol.asyncIterator]();
+    await other.next();
+    await h.advance(4 * MIN + 30_000);
+    assert.equal(h.logLines().filter((l) => l.kind === 'stop' && l.reason === 'stale').length, 0);
+    assert.equal(h.streamCalls.length, 1);
+    for await (const _ of other) { /* drain */ }
+  });
+
+  test('v1d 压缩的前置检查仍用“该会话任意路线”：另一路线在途 → 压缩不开始', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    const other = h.open(HIT, { provider: COMPACT_KIMI.provider, model: COMPACT_KIMI.model })[Symbol.asyncIterator]();
+    await other.next();
+    await h.advance(9 * MIN + 30_000);
+    // 10 分钟时另一路线仍在途 → 压缩不启动（不会在流途中压缩）
+    mock.timers.tick(MIN);
+    await flush();
+    assert.equal(comp.calls, 0, 'startCompaction 用会话级 inflight');
+    for await (const _ of other) { /* drain */ }
+  });
+
+  test('v1e q1/q2 语义保持：同路线两个并发流先结束一个仍推迟', async () => {
+    h = await setup();
+    await h.real(HIT);
+    const a = h.open(HIT)[Symbol.asyncIterator]();
+    const b = h.open(HIT)[Symbol.asyncIterator]();
+    await a.next(); await b.next();
+    let x; do { x = await a.next(); } while (!x.done);
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 0);
+    do { x = await b.next(); } while (!x.done);
+    await h.advance(30_000);
+    assert.equal(h.streamCalls.length, 1);
+  });
+});
+
+describe('v2 手动压缩检测（session/event）', () => {
+  test('v2a 手动 compaction/end（turn null、无 error）→ lastCompaction manual；默认 reset：stopped、快照清空、日志 manual', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.emitSessionEvent(SID, manualEvt());
+    const e = h.sessionsEntry?.() ?? null;
+    const st = await h.state();
+    assert.equal(st.windows[SID].lastCompaction.kind, 'manual');
+    assert.equal(st.windows[SID].lastCompaction.status, 'success');
+    assert.equal(st.windows[SID].stopped, true);
+    assert.ok(h.logLines().some((l) => l.kind === 'compact' && l.status === 'manual' && l.via === 'user'));
+    await h.advance(30 * MIN);
+    assert.equal(h.streamCalls.length, 0, '手动压缩后不再重放');
+  });
+
+  test('v2b compactResetOnManual=false → 只记 lastCompaction，保活继续', async () => {
+    h = await setup({ config: { compactResetOnManual: false } });
+    await h.real(HIT);
+    h.emitSessionEvent(SID, manualEvt());
+    const st = await h.state();
+    assert.equal(st.windows[SID].lastCompaction.kind, 'manual');
+    assert.equal(st.windows[SID].stopped, false);
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 1, '保活照常');
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact' && l.status === 'manual').length, 0, '不追加 manual 日志');
+  });
+
+  test('v2c compactResetOnManual 非布尔（"no"）按 true 处理', async () => {
+    h = await setup({ config: { compactResetOnManual: 'no' } });
+    assert.equal((await h.state()).config.compactResetOnManual, true);
+  });
+
+  test('v2d 有 error 的 compaction/end → 不处理', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.emitSessionEvent(SID, { type: 'compaction/end', data: { turn: null, error: 'boom' } });
+    assert.equal((await h.state()).windows[SID].lastCompaction, null);
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 1);
+  });
+
+  test('v2e turn 非 null（回合内自动压缩）→ 不处理', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.emitSessionEvent(SID, { type: 'compaction/end', data: { turn: 3 } });
+    assert.equal((await h.state()).windows[SID].lastCompaction, null);
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 1);
+  });
+
+  test('v2f 插件自己的压缩（compacting 中）→ 不被当作手动', async () => {
+    let finish;
+    const comp = { calls: 0, compactNow: () => { comp.calls += 1; return new Promise((r) => { finish = r; }); } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 1);
+    h.emitSessionEvent(SID, manualEvt());   // 插件压缩进行中的 compaction/end
+    const st = await h.state();
+    assert.equal(st.windows[SID].lastCompaction, null, '不记 manual');
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact' && l.status === 'manual').length, 0);
+    finish({ shadowedTokenCount: 1 });
+    await flush(); await flush();
+  });
+
+  test('v2g entry 不存在 → 不处理（不抛错）', async () => {
+    h = await setup();
+    h.emitSessionEvent('nobody', manualEvt());
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact').length, 0);
+  });
+
+  test('v2h 手动压缩后下一次真实请求重新武装，能再次保活，并能再次自动压缩', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    h.emitSessionEvent(SID, manualEvt());
+    await h.advance(20 * MIN);
+    assert.equal(h.streamCalls.length, 0);
+    assert.equal(comp.calls, 0, '手动后不自动压缩');
+    await h.real(HIT);                                  // 新快照，重新武装
+    assert.equal((await h.state()).windows[SID].stopped, false);
+    await h.advance(4 * MIN + 30_000);
+    assert.equal(h.streamCalls.length, 1, '重新保活');
+    await h.advance(6 * MIN);
+    assert.equal(comp.calls, 1, '再次到期压缩');
+  });
+});
+
+describe('v3 压缩倒计时状态（windows.compactStatus）', () => {
+  test('v3a off：压缩开关关', async () => {
+    h = await setup({ config: { compactEnabled: false } });
+    await h.real(HIT);
+    assert.equal((await h.state()).windows[SID].compactStatus, 'off');
+  });
+
+  test('v3b waiting：开着但无 entry（如重载后无快照）', async () => {
+    h = await setup({ config: { sessionEnabled: { [SID]: true }, compactEnabled: true } });
+    const st = await h.state();
+    assert.equal(st.windows[SID], undefined, '无 entry 且保活开：窗口不列出或 waiting');
+  });
+
+  test('v3c counting：倒计时随快进递减', async () => {
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 } });
+    await h.real(HIT);
+    let st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'counting');
+    assert.equal(st.windows[SID].compactDueSeconds, 600);
+    assert.equal(st.windows[SID].compactAfterMinutes, 10);
+    assert.equal(st.windows[SID].lastCompaction, null);
+    await h.advance(4 * MIN);
+    st = await h.state();
+    assert.equal(st.windows[SID].compactDueSeconds, 360);
+  });
+
+  test('v3d running：压缩进行中', async () => {
+    let finish;
+    const comp = { calls: 0, compactNow: () => { comp.calls += 1; return new Promise((r) => { finish = r; }); } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    const st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'running');
+    assert.equal(st.windows[SID].compactDueSeconds, null);
+    finish({ shadowedTokenCount: 1 });
+    await flush(); await flush();
+  });
+
+  test('v3e done：自动压缩成功后 lastCompaction auto/success，状态 done；下一次真实请求回到 counting', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    let st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'done');
+    assert.equal(st.windows[SID].lastCompaction.kind, 'auto');
+    assert.equal(st.windows[SID].lastCompaction.status, 'success');
+    assert.equal(st.windows[SID].compactDueSeconds, null);
+    await h.real(HIT);
+    st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'counting');
+  });
+
+  test('v3f auto 失败 → lastCompaction status error，状态 done', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; throw new Error('boom'); } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    const st = await h.state();
+    assert.equal(st.windows[SID].lastCompaction.status, 'error');
+    assert.equal(st.windows[SID].compactStatus, 'done');
+  });
+
+  test('v3g manual：手动压缩后状态 manual；下一次真实请求后回到 counting', async () => {
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 } });
+    await h.real(HIT);
+    h.emitSessionEvent(SID, manualEvt());
+    let st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'manual');
+    assert.equal(st.windows[SID].lastCompaction.kind, 'manual');
+    await h.real(HIT);
+    st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'counting');
+  });
+
+  test('v3h stopped：缓存 miss 停止（无压缩记录）', async () => {
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 0, inputTokens: 5100, outputTokens: 16 };
+    await h.advance(4 * MIN + 30_000);
+    const st = await h.state();
+    assert.equal(st.windows[SID].compactStatus, 'stopped');
+    assert.equal(st.windows[SID].lastCompaction, null);
   });
 });

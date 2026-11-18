@@ -287,13 +287,14 @@ window.__ModuleLoader__.load({
         const base = {
           enabled: typeof config.enabled === 'boolean' ? config.enabled : !!(state && state.enabled),
           compactEnabled: config.compactEnabled === true,
+          compactResetOnManual: config.compactResetOnManual !== false,
           intervalMinutes: config.intervalMinutes,
           maxIdleMinutes: config.maxIdleMinutes,
           replayMaxTokens: config.replayMaxTokens,
           compactAfterMinutes: config.compactAfterMinutes
         };
         const loaded = state !== null;
-        const bools = { enabled: true, compactEnabled: true };
+        const bools = { enabled: true, compactEnabled: true, compactResetOnManual: true };
         const raw = (key) => (edits[key] !== undefined ? edits[key] : base[key] === undefined || base[key] === null ? '' : String(base[key]));
         const boolValue = (key) => (edits[key] !== undefined ? edits[key] : base[key]);
         const parsed = {};
@@ -446,6 +447,10 @@ window.__ModuleLoader__.load({
                 desc: '保活期间空闲满这么久就压缩一次。范围 5–120。',
                 error: errors.compactAfterMinutes
               }, numberInput('compactAfterMinutes', '分钟', '空闲多久后压缩')),
+              h(SettingRow, {
+                title: '手动压缩时清零倒计时',
+                desc: '你在窗口里手动执行 /compact 后，该窗口的自动压缩倒计时清零：已过时的保活请求快照会被丢弃，保活与压缩都等下一条真实消息后重新开始。关闭则不处理手动压缩。'
+              }, h(Switch, { checked: boolValue('compactResetOnManual') === true, onChange: (v) => edit('compactResetOnManual', v), disabled: !loaded, label: '手动压缩时清零倒计时' })),
               h('div', { className: 'ka-note' }, h('i', { 'aria-hidden': 'true' }, 'i'),
                 h('span', null, '压缩开启的窗口，空闲满 ', h('b', { className: 'ka-num' }, String(compactMinutes)), ' 分钟后压缩一次并停止保活，下一次真实请求再重新开始。请勿与 ', h('code', null, 'dsh-auto-compact'), ' 同装，否则它会提前压缩、让保活白费。'))
             )
@@ -473,8 +478,24 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // The 压缩 label of one session row, driven by the Host's compactStatus.
+      function compactChip(win, s, minutes, now, receivedAt) {
+        if (!win) return null;
+        const status = win.compactStatus;
+        if (status === undefined) return win.compact ? h('span', { className: 'ka-chip warn' }, '压缩 ' + minutes + ' 分') : null;
+        if (status === 'counting') {
+          const due = typeof win.compactDueSeconds === 'number' ? Math.max(0, win.compactDueSeconds - (now - (receivedAt || now)) / 1000) : null;
+          return h('span', { className: 'ka-chip warn ka-num', title: '距自动压缩' }, due === null ? '压缩' : due <= 0 ? '即将压缩' : '压缩 ' + countdown(due));
+        }
+        if (status === 'running') return h('span', { className: 'ka-chip warn' }, '压缩中');
+        if (status === 'done' || status === 'manual') return h('span', { className: 'ka-chip ok', title: status === 'manual' ? '已手动压缩，等下一条消息重新计时' : '已自动压缩，等下一条消息重新计时' }, '已压缩');
+        if (status === 'waiting') return h('span', { className: 'ka-chip', title: '等待下一条消息开始计时' }, '待命');
+        if (status === 'stopped') return s.stopped ? null : h('span', { className: 'ka-chip err', title: '本轮保活已停，不会自动压缩' }, '本轮已停');
+        return null;
+      }
+
       function SessionList({ sessions, windows, receivedAt, compactMinutes, loaded }) {
-        const ticking = sessions.some((s) => typeof s.nextDueSeconds === 'number');
+        const ticking = sessions.some((s) => typeof s.nextDueSeconds === 'number' || (windows[s.id] && windows[s.id].compactStatus === 'counting'));
         const [now, setNow] = React.useState(Date.now());
         React.useEffect(() => {
           if (!ticking) return undefined;
@@ -501,7 +522,7 @@ window.__ModuleLoader__.load({
             ),
             h('span', { className: 'ka-chips' },
               h('span', { className: cx('ka-chip', s.enabled ? 'ok' : '') }, s.enabled ? '保活开' : '保活关'),
-              win && win.compact && s.enabled ? h('span', { className: 'ka-chip warn' }, '压缩 ' + compactMinutes + ' 分') : null,
+              s.enabled ? compactChip(win, s, compactMinutes, now, receivedAt) : null,
               s.enabled && !s.armed ? h('span', { className: 'ka-chip' }, '待首次命中') : null,
               s.enabled && s.stopped ? h('span', { className: 'ka-chip err' }, '本轮已停') : null
             ),
@@ -751,11 +772,96 @@ window.__ModuleLoader__.load({
         );
       }
 
+      /**
+       * Hover card for one window's idle auto-compaction. Same frame/portal/delayed-close
+       * mechanism as WindowTip. The countdown is the Host's compactDueSeconds (as of the
+       * last poll) minus the local time elapsed since; the 1s timer exists only while
+       * this card is mounted (= open).
+       */
+      function CompactTip({ rect, enabled, compactOn, win, minutes, receivedAt, onEnter, onLeave }) {
+        const [now, setNow] = React.useState(Date.now());
+        React.useEffect(() => {
+          const timer = setInterval(() => setNow(Date.now()), 1000);
+          return () => clearInterval(timer);
+        }, []);
+        const frame = {
+          position: 'fixed',
+          zIndex: 2147483000,
+          width: 248,
+          boxSizing: 'border-box',
+          padding: '10px 12px',
+          borderRadius: TIP.radius,
+          border: '1px solid ' + TIP.border,
+          background: TIP.bg,
+          color: TIP.label,
+          boxShadow: TIP.shadow,
+          fontSize: 12,
+          lineHeight: 1.55
+        };
+        if (rect) {
+          frame.left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - 256));
+          if (rect.top > 210) frame.bottom = Math.max(8, window.innerHeight - rect.top + 8);
+          else frame.top = Math.min(window.innerHeight - 16, rect.bottom + 8);
+        }
+        const warn = 'var(--dsw-alias-state-warn-primary, #d99600)';
+        // Which message to show. Keep-alive off wins: the Host only reports windows that are on.
+        let status;
+        if (enabled === null || compactOn === null) status = 'loading';
+        else if (enabled !== true) status = 'needKeepalive';
+        else if (!compactOn) status = 'off';
+        else status = win && win.compactStatus ? win.compactStatus : 'loading';
+        const minutesText = (win && win.compactAfterMinutes) || minutes;
+        const last = win && win.lastCompaction ? win.lastCompaction : null;
+        const lastAt = last && last.at ? clock(last.at) : null;
+        const note = (text) => h('div', { style: { color: TIP.secondary, lineHeight: 1.6, textWrap: 'pretty' } }, text);
+        let body;
+        if (status === 'counting') {
+          const due = win && typeof win.compactDueSeconds === 'number' ? Math.max(0, win.compactDueSeconds - (now - (receivedAt || now)) / 1000) : null;
+          body = h('div', null,
+            h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, margin: '2px 0 4px' } },
+              h('span', { style: { fontSize: due !== null && due <= 0 ? 18 : 28, lineHeight: 1.15, fontWeight: 600, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', color: TIP.label } },
+                due === null ? '—' : due <= 0 ? '即将压缩' : countdown(due)),
+              due !== null && due > 0 ? h('span', { style: { color: TIP.tertiary } }, '后压缩') : null),
+            note('空闲满 ' + minutesText + ' 分钟后压缩一次，之后停止保活'));
+        } else if (status === 'running') body = note('正在压缩…');
+        else if (status === 'done' || status === 'manual') {
+          body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+            note('已' + (status === 'manual' ? '手动' : '自动') + '压缩，倒计时已清零；下一条消息起重新计时'),
+            lastAt ? h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 10 } },
+              h('span', { style: { color: TIP.tertiary } }, '压缩时间'),
+              h('span', { style: { fontWeight: 500, fontVariantNumeric: 'tabular-nums' } }, lastAt)) : null);
+        } else if (status === 'stopped') body = note('本轮保活已停（缓存可能已过期），不会自动压缩；下一条消息起重新计时');
+        else if (status === 'waiting') body = note('等待下一条消息开始计时（插件刚重载/重启，快照在内存里）');
+        else if (status === 'needKeepalive') body = note('需要先开启本窗口的保活');
+        else if (status === 'off') body = note('本窗口未开启自动压缩，点击开启');
+        else body = note('正在读取本窗口状态…');
+        const stateText = status === 'loading' ? '读取中' : status === 'needKeepalive' || status === 'off' ? '本窗口关' : '本窗口开';
+        return ReactDOM.createPortal(
+          h('div', {
+            'data-plugin': 'cache-keepalive-compact-tip',
+            role: 'tooltip',
+            style: frame,
+            onMouseEnter: onEnter,
+            onMouseLeave: onLeave
+          },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 } },
+              h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: status === 'counting' || status === 'running' ? warn : 'rgba(127,127,127,0.55)', display: 'inline-block' } }),
+              h('strong', { style: { fontSize: 12 } }, '空闲后自动压缩'),
+              h('span', { style: { color: TIP.tertiary } }, stateText)
+            ),
+            body,
+            h('div', { style: { marginTop: 7, paddingTop: 6, borderTop: '1px solid ' + TIP.border, color: TIP.tertiary } },
+              '压缩期间若有新消息会排队到压缩结束；手动 /compact 的处理见设置页。')
+          ),
+          document.body
+        );
+      }
+
       // One compact start/pause pill beside the message composer. It controls
       // ONLY the conversation it renders in: the Host stores a per-session switch,
       // so toggling one window never changes another.
       function ComposerButton({ sessionId }) {
-        const { state, refresh } = useStatus();
+        const { state, refresh, receivedAt } = useStatus();
         const [busy, setBusy] = React.useState(false);
         const [pending, setPending] = React.useState(null);
         const [tip, setTip] = React.useState(null);
@@ -782,7 +888,7 @@ window.__ModuleLoader__.load({
           if (compactPending !== null && compactStored === compactPending) setCompactPending(null);
         }, [compactPending, compactStored]);
         const toggleCompact = async () => {
-          if (compactBusy.current || compactOn === null || typeof sessionId !== 'string' || sessionId.length === 0) return;
+          if (compactBusy.current || compactOn === null || enabled !== true || typeof sessionId !== 'string' || sessionId.length === 0) return;
           compactBusy.current = true;
           const next = !compactOn;
           setCompactPending(next);
@@ -830,6 +936,40 @@ window.__ModuleLoader__.load({
           hideTimer.current = setTimeout(() => {
             hideTimer.current = null;
             setTip(null);
+          }, 120);
+        };
+        // Same hover-card plumbing for the 压缩 half (own anchor, own delayed close).
+        const [ctip, setCtip] = React.useState(null);
+        const compactRef = React.useRef(null);
+        const compactHide = React.useRef(null);
+        React.useEffect(() => () => {
+          if (compactHide.current !== null) clearTimeout(compactHide.current);
+        }, []);
+        React.useEffect(() => {
+          if (ctip === null) return undefined;
+          const close = () => setCtip(null);
+          window.addEventListener('resize', close);
+          return () => window.removeEventListener('resize', close);
+        }, [ctip]);
+        const openCompactTip = () => {
+          if (compactHide.current !== null) {
+            clearTimeout(compactHide.current);
+            compactHide.current = null;
+          }
+          const node = compactRef.current;
+          let rect = null;
+          try {
+            rect = node && typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
+          } catch {
+            rect = null;
+          }
+          setCtip({ rect });
+        };
+        const closeCompactTip = () => {
+          if (compactHide.current !== null) clearTimeout(compactHide.current);
+          compactHide.current = setTimeout(() => {
+            compactHide.current = null;
+            setCtip(null);
           }, 120);
         };
         const toggle = async () => {
@@ -904,13 +1044,18 @@ window.__ModuleLoader__.load({
         const compactPill = missing ? null : h('button', {
           type: 'button',
           'data-plugin': 'cache-keepalive-compact-toggle',
-          title: enabled !== true
+          ref: compactRef,
+          title: canFloat
+            ? undefined
+            : enabled !== true
             ? '空闲自动压缩：需要先开启本窗口的「保活」'
             : compactOn
               ? '空闲自动压缩：已开启（保活期间空闲满 ' + compactMinutes + ' 分钟压缩一次并停止保活），点击关闭'
               : '空闲自动压缩：已关闭，点击开启（空闲满 ' + compactMinutes + ' 分钟压缩一次）',
           'aria-label': '空闲自动压缩开关（仅本会话）',
-          disabled: compactOn === null || enabled !== true,
+          // aria-disabled (not disabled): a disabled button swallows hover, and the card must explain why it is dim.
+          'aria-disabled': compactDim ? 'true' : undefined,
+          disabled: compactOn === null,
           onClick: toggleCompact,
           style: {
             display: 'inline-flex',
@@ -969,7 +1114,26 @@ window.__ModuleLoader__.load({
             onLeave: closeTip
           })
         );
-        return oval(keepAlivePill, divider, compactPill);
+        const compactWrapped = h('span', {
+          style: { display: 'inline-flex', alignItems: 'stretch', flex: '0 0 auto', whiteSpace: 'nowrap' },
+          onMouseEnter: openCompactTip,
+          onMouseLeave: closeCompactTip,
+          onFocus: openCompactTip,
+          onBlur: closeCompactTip
+        },
+          compactPill,
+          ctip === null ? null : h(CompactTip, {
+            rect: ctip.rect,
+            enabled: enabled === null ? null : enabled === true,
+            compactOn,
+            win: state && state.windows ? state.windows[sessionId] : null,
+            minutes: compactMinutes,
+            receivedAt,
+            onEnter: openCompactTip,
+            onLeave: closeCompactTip
+          })
+        );
+        return oval(keepAlivePill, divider, compactWrapped);
       }
 
       // Page body of the Cmd+, Settings section: the same card as the Plugins page, in page view.

@@ -38,6 +38,9 @@ saves nothing and only burns quota - leave those routes out of `config.routes`.
   (it needs keep-alive on). Each window keeps its own switches; toggling one never changes another.
 - **Hovering the keep-alive half** opens a small card with this window's numbers since it was switched
   on: keep-alives, spend, hits, cache-read tokens, net saving, the current idle gap.
+- **Hovering the compaction half** opens a card with the countdown to the next automatic compaction (or why
+  there is none: off, keep-alive off, waiting for the next message, running, done, cleared by a manual
+  `/compact`, or this idle gap already stopped) and the time of the last compaction.
 - **Settings (⌘,) → 缓存保活**, and the same page on the sidebar **Plugins** page (Official group, and the
   plugin row's *Configure*): status blocks, the editable settings below, the tracked sessions with a
   countdown to their next keep-alive, and a per-conversation record list (click a row for the
@@ -53,6 +56,7 @@ saves nothing and only burns quota - leave those routes out of `config.routes`.
 | max keep-alive duration | 45 min (1-1440) | the only length cap per idle gap. The number of keep-alives is *derived*: `floor(duration / interval)`, shown read-only. 45 min keeps a Claude-class route below its break-even |
 | replay output cap | 16 (2-64) | `maxTokens` of the replay. At least 2: some relays short-circuit `max_tokens: 1` without touching the cache |
 | compaction default / minutes | off / 20 (5-120) | a window with compaction on, idle that long, is compacted once and keep-alive stops for it |
+| clear countdown on manual compaction | on | when the user runs `/compact` in a window the plugin tracks, that window's auto-compaction countdown is cleared: the now-obsolete request snapshot is dropped and keep-alive/compaction wait for the next real request, which starts a fresh countdown. Off = manual compaction is ignored |
 
 `maxTouches` (the old setting) is gone; a leftover `maxTouches` in `config.json` is ignored and noted
 in the log (`config-notice`).
@@ -95,6 +99,8 @@ saving. All figures are estimates, not a bill.
   session is stopped (`stale`) instead of paying for a cold rewrite - this also applies before a compaction.
 - Stops at the max keep-alive duration. A real request re-arms the session.
 - A replay in flight when a real request arrives is recorded but does not stop the new idle gap.
+- A due replay is deferred while a real stream **on the same route** is in flight (streams on other routes do not
+  touch that prefix's cache). If a replay is more than 30 s overdue, one `defer` line with the reason is logged per idle gap.
 - **Compaction** (opt-in per window, needs keep-alive on): when the window has been idle `compactAfterMinutes`
   and its agent is idle and has no stream in flight, the official compaction runs once (scoped
   `compaction.compactNow`, falling back to the `/compact` command) outside the replay lock, with a 10 min
@@ -127,7 +133,7 @@ prompt text.
 | file | purpose |
 |---|---|
 | `config.json` | live config (not committed), including the per-window `sessionEnabled` / `sessionCompact` maps; hot-reloaded every 2 s (a file that is not valid JSON is ignored and the previous settings are kept); written atomically. `scanSeconds` takes effect after a reload |
-| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `compact`, `config`, `session-switch`, `compact-switch`, `record-deleted` |
+| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `defer`, `compact`, `config`, `session-switch`, `compact-switch`, `record-deleted` |
 
 ## Limits
 
