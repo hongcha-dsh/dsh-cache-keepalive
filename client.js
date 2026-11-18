@@ -564,12 +564,12 @@ window.__ModuleLoader__.load({
             flex: '0 0 auto',
             whiteSpace: 'nowrap',
             writingMode: 'horizontal-tb',
-            padding: '2px 9px',
-            margin: '0 4px',
+            padding: '2px 9px 2px 10px',
+            margin: 0,
             color: 'inherit',
-            background: enabled === true ? 'rgba(63,191,111,0.12)' : 'transparent',
-            border: '1px solid ' + (enabled === true ? 'rgba(63,191,111,0.45)' : 'rgba(127,127,127,0.3)'),
-            borderRadius: 999,
+            background: enabled === true ? 'rgba(63,191,111,0.14)' : 'transparent',
+            border: 'none',
+            borderRadius: 0,
             cursor: missing || busy ? 'default' : 'pointer',
             font: 'inherit',
             fontSize: 12,
@@ -601,12 +601,12 @@ window.__ModuleLoader__.load({
             flex: '0 0 auto',
             whiteSpace: 'nowrap',
             writingMode: 'horizontal-tb',
-            padding: '2px 9px',
-            margin: '0 4px 0 0',
+            padding: '2px 10px 2px 9px',
+            margin: 0,
             color: 'inherit',
-            background: compactOn === true && !compactDim ? 'rgba(217,150,0,0.12)' : 'transparent',
-            border: '1px solid ' + (compactOn === true && !compactDim ? 'rgba(217,150,0,0.5)' : 'rgba(127,127,127,0.3)'),
-            borderRadius: 999,
+            background: compactOn === true && !compactDim ? 'rgba(217,150,0,0.14)' : 'transparent',
+            border: 'none',
+            borderRadius: 0,
             cursor: compactDim ? 'default' : 'pointer',
             font: 'inherit',
             fontSize: 12,
@@ -618,9 +618,24 @@ window.__ModuleLoader__.load({
           h('span', null, compactOn === true ? '压缩 ' + compactMinutes + 'm' : '压缩')
         );
 
-        if (!canFloat || missing) return h(React.Fragment, null, pill, compactPill);
+        // One oval holding both switches, split by a thin vertical rule.
+        const oval = (...parts) => h('span', {
+          'data-plugin': 'cache-keepalive-oval',
+          style: {
+            display: 'inline-flex',
+            alignItems: 'stretch',
+            flex: '0 0 auto',
+            whiteSpace: 'nowrap',
+            margin: '0 4px',
+            border: '1px solid rgba(127,127,127,0.3)',
+            borderRadius: 999,
+            overflow: 'hidden'
+          }
+        }, ...parts);
+        const divider = h('span', { style: { width: 1, alignSelf: 'stretch', background: 'rgba(127,127,127,0.3)', flex: '0 0 auto' } });
+        if (!canFloat || missing) return oval(pill, compactPill === null ? null : divider, compactPill);
         const keepAlivePill = h('span', {
-          style: { display: 'inline-flex', alignItems: 'center', flex: '0 0 auto', whiteSpace: 'nowrap' },
+          style: { display: 'inline-flex', alignItems: 'stretch', flex: '0 0 auto', whiteSpace: 'nowrap' },
           onMouseEnter: openTip,
           onMouseLeave: closeTip,
           onFocus: openTip,
@@ -636,7 +651,7 @@ window.__ModuleLoader__.load({
             onLeave: closeTip
           })
         );
-        return h(React.Fragment, null, keepAlivePill, compactPill);
+        return oval(keepAlivePill, divider, compactPill);
       }
 
       return {
