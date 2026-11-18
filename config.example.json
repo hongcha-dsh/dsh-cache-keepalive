@@ -4,7 +4,7 @@
   "intervalMinutes": 4,
   "maxIdleMinutes": 150,
   "maxTouches": 15,
-  "compactAfterMinutes": 0,
+  "compactAfterMinutes": 20,
   "replayMaxTokens": 16,
   "scanSeconds": 15,
   "maxSessions": 3,
@@ -23,5 +23,7 @@
     "huosan/kimi-k3.1-pro": 5
   },
   "prices": {},
-  "requireProvenCache": true
+  "requireProvenCache": true,
+  "compactEnabled": false,
+  "sessionCompact": {}
 }

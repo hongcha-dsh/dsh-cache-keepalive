@@ -293,7 +293,7 @@ describe('d 路由必须先被真实命中证明', () => {
 describe('e 空闲压缩 compactIdle / runCompaction', () => {
   test('e1 空闲超时 → 恰好一次 compactNow（agent 为参数）；之后绝不重放/再压缩', async () => {
     const comp = { calls: 0, args: null, compactNow: async (agentObj) => { comp.calls += 1; comp.args = agentObj; return { shadowedTokenCount: 1234 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(9 * MIN + 30_000);
     assert.equal(comp.calls, 0);
@@ -313,7 +313,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e2 compactNow 抛错 → 仍只调用一次，entry 停止，记录 error', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; throw new Error('boom'); } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 1);
@@ -327,7 +327,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e3 compactNow 返回 null（无操作）→ 同样只一次', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return null; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 1);
@@ -338,7 +338,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e4 agent 运行中 → 不触发、不停止；转为 idle 后再触发', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('running', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('running', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(30 * MIN);
     assert.equal(comp.calls, 0);
@@ -350,7 +350,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
   });
 
   test('e5 无 compaction 服务 → 回退 ctx.commands.execute(agent, "/compact")', async () => {
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', undefined) } });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', undefined) } });
     h.commandResult = { result: { kind: 'success', text: 'done' } };
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
@@ -365,7 +365,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
   });
 
   test('e5b 无服务且无 /compact 命令 → 记录 missing，仍只一次', async () => {
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', undefined) } });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', undefined) } });
     h.commandResult = undefined;
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
@@ -377,7 +377,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e6 压缩后下一次真实请求重新武装；再次空闲超时可再压缩一次', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 1);
@@ -401,7 +401,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
         return { shadowedTokenCount: 1 };
       }
     };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 1);
@@ -413,9 +413,9 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
     assert.equal(comp.calls, 1);
   });
 
-  test('e8 compactAfterMinutes=0：永不压缩，maxTouches 仍生效', async () => {
+  test('e8 compactEnabled=false：永不压缩，maxTouches 仍生效（即使 compactAfterMinutes 合法）', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 0, maxTouches: 2 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 2 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(60 * MIN);
     assert.equal(comp.calls, 0);
@@ -425,7 +425,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e9 压缩开启时不应用 maxTouches 上限', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10, maxTouches: 1 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, maxTouches: 1 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     await h.advance(9 * MIN + 30_000);
     assert.equal(h.streamCalls.length, 2, '超过 maxTouches=1 仍继续保活');
@@ -436,7 +436,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e10 缓存已判 miss（stopped）的会话不压缩', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     h.replayUsage = { cacheReadTokens: 0, inputTokens: 5100, outputTokens: 16 };
     await h.real(HIT);
     await h.advance(15 * MIN);
@@ -447,7 +447,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e11 有在途真实流时不压缩；流结束后下一次 tick 再压缩', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     const it = h.open(HIT);
     await it.next(); // 已开始迭代但未结束 → 在途
     await h.advance(10 * MIN + 30_000);
@@ -460,7 +460,7 @@ describe('e 空闲压缩 compactIdle / runCompaction', () => {
 
   test('e12 （观察）agent 不存在时：记录 skipped 并停止该会话', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: {}, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: {}, compaction: comp });
     await h.real(HIT);
     await h.advance(10 * MIN + 30_000);
     assert.equal(comp.calls, 0);
@@ -558,7 +558,7 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
 
   test('g1 compactAfterMinutes=3 → 夹到 5（4.5 分钟不压缩，5.5 分钟压缩）', async () => {
     const c = comp();
-    h = await setup({ config: { compactAfterMinutes: 3 }, agents: { [SID]: agent('idle', c) }, compaction: c });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 3 }, agents: { [SID]: agent('idle', c) }, compaction: c });
     await h.real(HIT);
     await h.advance(4.5 * MIN);
     assert.equal(c.calls, 0);
@@ -568,7 +568,7 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
 
   test('g2 compactAfterMinutes=500 → 夹到 120（119 分钟不压缩，121 分钟压缩）', async () => {
     const c = comp();
-    h = await setup({ config: { compactAfterMinutes: 500 }, agents: { [SID]: agent('idle', c) }, compaction: c });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 500 }, agents: { [SID]: agent('idle', c) }, compaction: c });
     await h.real(HIT);
     await h.advance(119 * MIN);
     assert.equal(c.calls, 0);
@@ -576,18 +576,42 @@ describe('g normalizeConfig 夹取（经 apply 间接验证）', () => {
     assert.equal(c.calls, 1);
   });
 
-  for (const bad of [-5, 0, 'abc', null]) {
-    test(`g3 compactAfterMinutes=${JSON.stringify(bad)} → 关闭，maxTouches 生效`, async () => {
+  for (const bad of [-5, 0, 'abc', null, undefined]) {
+    test(`g3 compactAfterMinutes=${JSON.stringify(bad)} → 回落为 20（19 分钟不压缩，21 分钟压缩）`, async () => {
       const c = comp();
-      h = await setup({ config: { compactAfterMinutes: bad, maxTouches: 2 }, agents: { [SID]: agent('idle', c) }, compaction: c });
+      h = await setup({ config: { compactEnabled: true, compactAfterMinutes: bad, maxTouches: 2 }, agents: { [SID]: agent('idle', c) }, compaction: c });
+      const st0 = await h.state();
+      assert.equal(st0.config.compactAfterMinutes, 20);
       await h.real(HIT);
-      await h.advance(60 * MIN);
+      await h.advance(19 * MIN);
       assert.equal(c.calls, 0);
-      assert.equal(h.streamCalls.length, 2);
-      h.teardown();
-      h = null;
+      await h.advance(2 * MIN);
+      assert.equal(c.calls, 1);
     });
   }
+
+  test('g3b 非数字字符串 "12" 视为有效数字 → 12 分钟（Number 强转）', async () => {
+    const c = comp();
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: '12' }, agents: { [SID]: agent('idle', c) }, compaction: c });
+    assert.equal((await h.state()).config.compactAfterMinutes, 12);
+  });
+
+  test('g3c 未配置 compactAfterMinutes → 默认 20', async () => {
+    h = await setup({ config: { compactEnabled: true } });
+    assert.equal((await h.state()).config.compactAfterMinutes, 20);
+  });
+
+  test('g3d compactEnabled 非布尔（"true"）→ 视为 false', async () => {
+    h = await setup({ config: { compactEnabled: 'true', compactAfterMinutes: 10 } });
+    const st = await h.state();
+    assert.equal(st.config.compactEnabled, false);
+  });
+
+  test('g3e sessionCompact 非布尔值被丢弃', async () => {
+    h = await setup({ config: { compactEnabled: true, sessionCompact: { [SID]: 'yes', s2: false } } });
+    const st = await h.state();
+    assert.deepEqual(st.config.sessionCompact, { s2: false });
+  });
 
   test('g4 sessionEnabled 非布尔值被丢弃 → 回落到默认 enabled=true', async () => {
     h = await setup({ config: { enabled: true, sessionEnabled: { [SID]: 'yes' } } });
@@ -653,11 +677,173 @@ describe('h inflight 生命周期', () => {
 
   test('h2 真实流被创建后被 return() 关闭 → 压缩也不应被永久阻塞', async () => {
     const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
-    h = await setup({ config: { compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
     await h.real(HIT);
     const it = h.open(HIT);
     await it.return();
     await h.advance(11 * MIN);
     assert.equal(comp.calls, 1, 'inflight 不应因未迭代的流而永久阻塞压缩');
+  });
+});
+
+// ---------------- i. 窗口级压缩开关（新语义） ----------------
+const S2 = 's2';
+describe('i 窗口级压缩开关', () => {
+  test('i-a 两个窗口同时保活：仅 sessionCompact=true 的被压缩；另一个继续保活并受 maxTouches 约束', async () => {
+    const comp = { calls: 0, args: [], compactNow: async (a) => { comp.calls += 1; comp.args.push(a); return { shadowedTokenCount: 1 }; } };
+    h = await setup({
+      config: { sessionEnabled: { [SID]: true, [S2]: true }, compactEnabled: false, sessionCompact: { [SID]: true }, compactAfterMinutes: 10, maxTouches: 3 },
+      agents: { [SID]: agent('idle', comp), [S2]: agent('idle', comp) },
+      compaction: comp
+    });
+    await h.real(HIT, { sessionId: SID });
+    await h.real(HIT, { sessionId: S2 });
+    await h.advance(60 * MIN);
+
+    assert.equal(comp.calls, 1, '只压缩一次（s1）');
+    assert.equal(comp.args[0], h.agents[SID]);
+    const compacts = h.logLines().filter((l) => l.kind === 'compact');
+    assert.equal(compacts.length, 1);
+    assert.equal(compacts[0].session, SID);
+
+    const reps = h.streamCalls.map((o) => o.sessionId);
+    assert.equal(reps.filter((x) => x === S2).length, 3, 's2 受 maxTouches=3 约束');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.session === S2 && l.reason === 'max-touches'));
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.session === SID && l.reason === 'max-touches'), 's1 压缩时不应用 maxTouches');
+
+    const st = await h.state();
+    assert.equal(st.windows[SID].compact, true);
+    assert.equal(st.windows[S2].compact, false);
+  });
+
+  test('i-b sessionCompact[id]=false 覆盖 compactEnabled=true', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({
+      config: { compactEnabled: true, compactAfterMinutes: 10, sessionCompact: { [SID]: false }, maxTouches: 2 },
+      agents: { [SID]: agent('idle', comp) },
+      compaction: comp
+    });
+    await h.real(HIT);
+    await h.advance(60 * MIN);
+    assert.equal(comp.calls, 0, '显式 false 覆盖默认 true');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-touches'), '关闭压缩后 maxTouches 生效');
+    const st = await h.state();
+    assert.equal(st.windows[SID].compact, false);
+  });
+
+  test('i-c 运行中途经端点把压缩从关改开，到点压缩；再改关则不再压缩', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(5 * MIN);
+    assert.equal((await h.state()).windows[SID].compact, false);
+
+    let r = await h.http(SWITCH, { method: 'POST', body: { session: SID, compact: true } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.compact, true);
+    assert.equal(r.body.enabled, true, 'compact-only 请求不改保活开关');
+    assert.equal((await h.state()).windows[SID].compact, true);
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact-switch' && l.enabled === true).length, 1);
+
+    await h.advance(5 * MIN + 30_000);
+    assert.equal(comp.calls, 1, '到点（距上次真实请求 10 分钟）压缩');
+
+    // 另一个窗口的场景：再开一次真实请求后关闭压缩，应不再压缩
+    h.agents[SID].status = 'idle';
+    await h.real(HIT);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, compact: false } });
+    assert.equal(r.body.compact, false);
+    await h.advance(30 * MIN);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('i-c2 运行中途改为开启：此前已过的空闲时间直接满足阈值，立即压缩（下一 tick）', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(12 * MIN);
+    assert.equal(comp.calls, 0);
+    await h.http(SWITCH, { method: 'POST', body: { session: SID, compact: true } });
+    await h.advance(30_000);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('i-d 压缩开关开、保活关闭的窗口不压缩（且不被跟踪）', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({
+      config: { sessionEnabled: {}, compactEnabled: true, compactAfterMinutes: 10 },
+      agents: { [SID]: agent('idle', comp) },
+      compaction: comp
+    });
+    await h.real(HIT);
+    await h.advance(30 * MIN);
+    assert.equal(comp.calls, 0);
+    assert.equal(h.streamCalls.length, 0);
+    assert.equal((await h.state()).sessions.length, 0);
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact').length, 0);
+  });
+
+  test('i-d2 保活开启后被关闭（压缩开关仍开）→ 不压缩', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { sessionEnabled: {}, compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true } });
+    await h.real(HIT);
+    await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: false } });
+    await h.advance(30 * MIN);
+    assert.equal(comp.calls, 0);
+    assert.equal(h.streamCalls.length, 0);
+  });
+
+  test('i-e 端点：{session,compact} 与 {session,enabled} 各自独立，可同时传', async () => {
+    h = await setup({ config: { sessionEnabled: {} } });
+    let r = await h.http(SWITCH, { method: 'POST', body: { session: SID, compact: true } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.enabled, false);
+    assert.equal(r.body.compact, true);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true } });
+    assert.equal(r.body.enabled, true);
+    assert.equal(r.body.compact, true, '只改保活不影响压缩');
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: false, compact: false } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.enabled, false);
+    assert.equal(r.body.compact, false);
+    const cfg = (await h.state()).config;
+    assert.equal(cfg.sessionCompact[SID], false);
+    assert.equal(cfg.sessionEnabled[SID], false);
+    assert.equal(cfg.compactEnabled, false);
+  });
+
+  test('i-e2 端点：缺字段或类型错误 → 400', async () => {
+    h = await setup();
+    const bad = [
+      { body: {} },
+      { body: { session: SID } },
+      { body: { compact: true } },
+      { body: { session: SID, compact: 'yes' } },
+      { body: { session: SID, compact: 1 } },
+      { body: { session: SID, enabled: 'true' } },
+      { body: { session: SID, enabled: 1, compact: true } },
+      { body: { session: '' , compact: true } }
+    ];
+    for (const { body } of bad) {
+      const r = await h.http(SWITCH, { method: 'POST', body });
+      assert.equal(r.status, 400, JSON.stringify(body));
+    }
+  });
+
+  test('i-e3 端点 state 回显：windows[id].compact 与 config.compactEnabled/sessionCompact', async () => {
+    h = await setup({ config: { compactEnabled: true, sessionCompact: { [SID]: false } } });
+    await h.real(HIT);
+    const st = await h.state();
+    assert.equal(st.config.compactEnabled, true);
+    assert.deepEqual(st.config.sessionCompact, { [SID]: false });
+    assert.equal(st.windows[SID].compact, false);
+    assert.equal(typeof st.windows[SID].enabled, 'boolean');
+  });
+
+  test('i-e4 无 compact 时的窗口默认值：从未显式选择的窗口跟随 compactEnabled', async () => {
+    h = await setup({ config: { compactEnabled: true, sessionCompact: {} } });
+    await h.real(HIT);
+    assert.equal((await h.state()).windows[SID].compact, true);
   });
 });

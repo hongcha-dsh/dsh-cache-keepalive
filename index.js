@@ -37,8 +37,12 @@ const DEFAULTS = {
   intervalMinutes: 4,
   maxIdleMinutes: 150,
   maxTouches: 15,
-  /** 0 = off. Otherwise 5-120: after this many idle minutes, compact the session once and stop keeping it alive. */
-  compactAfterMinutes: 0,
+  /** Idle minutes (5-120) before a compaction-enabled window is compacted once, after which keep-alive stops for it. */
+  compactAfterMinutes: 20,
+  /** Default for a window that never chose explicitly. Off: compaction is always opt-in per window. */
+  compactEnabled: false,
+  /** sessionId -> boolean: the per-window compaction switch (needs that window's keep-alive on). */
+  sessionCompact: {},
   /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
   prices: {},
   replayMaxTokens: 16,
@@ -80,7 +84,15 @@ function normalizeConfig(raw) {
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
   if (!Number.isFinite(cfg.maxSessions) || cfg.maxSessions < 1) cfg.maxSessions = DEFAULTS.maxSessions;
   const compact = Number(cfg.compactAfterMinutes);
-  cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : 0;
+  cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : DEFAULTS.compactAfterMinutes;
+  cfg.compactEnabled = cfg.compactEnabled === true;
+  const perSessionCompact = {};
+  if (cfg.sessionCompact && typeof cfg.sessionCompact === 'object' && !Array.isArray(cfg.sessionCompact)) {
+    for (const [sessionId, value] of Object.entries(cfg.sessionCompact)) {
+      if (typeof sessionId === 'string' && sessionId.length > 0 && typeof value === 'boolean') perSessionCompact[sessionId] = value;
+    }
+  }
+  cfg.sessionCompact = perSessionCompact;
   const prices = {};
   if (cfg.prices && typeof cfg.prices === 'object' && !Array.isArray(cfg.prices)) {
     for (const [key, value] of Object.entries(cfg.prices)) {
@@ -337,6 +349,21 @@ export function apply(ctx) {
     appendLog({ kind: 'session-switch', session: sessionId, enabled: enabled === true });
   }
 
+  /** Per-window compaction switch: explicit window choice wins over the config default. */
+  function compactEnabledOf(sessionId) {
+    const map = cfg.sessionCompact && typeof cfg.sessionCompact === 'object' ? cfg.sessionCompact : {};
+    if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
+    return cfg.compactEnabled === true;
+  }
+  function setSessionCompactOf(sessionId, enabled) {
+    const map = { ...(cfg.sessionCompact && typeof cfg.sessionCompact === 'object' ? cfg.sessionCompact : {}) };
+    map[sessionId] = enabled === true;
+    const keys = Object.keys(map);
+    for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
+    cfg = saveConfig({ ...cfg, sessionCompact: map });
+    appendLog({ kind: 'compact-switch', session: sessionId, enabled: enabled === true });
+  }
+
   function prune() {
     if (sessions.size <= cfg.maxSessions) return;
     const newestFirst = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt);
@@ -445,6 +472,7 @@ export function apply(ctx) {
       const entry = sessions.get(sessionId);
       windows[sessionId] = {
         enabled,
+        compact: compactEnabledOf(sessionId),
         since: since === null ? null : since,
         ...summarizeSession(kept),
         lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
@@ -672,12 +700,13 @@ export function apply(ctx) {
     }
     if (busy) return;
     if (entry.stopped) return;
-    if (cfg.compactAfterMinutes > 0 && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000) {
+    const compactOn = compactEnabledOf(sessionId);
+    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000) {
       await compactIdle(sessionId, entry);
       return;
     }
-    // With compaction on, the compaction itself ends the idle gap; the touch cap only guards the compaction-off case.
-    if (cfg.compactAfterMinutes === 0 && entry.touches >= cfg.maxTouches) {
+    // With compaction on for this window, the compaction itself ends the idle gap; the touch cap only guards the compaction-off case.
+    if (!compactOn && entry.touches >= cfg.maxTouches) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-touches', touches: entry.touches });
       return;
@@ -796,6 +825,8 @@ export function apply(ctx) {
         maxTouches: cfg.maxTouches,
         replayMaxTokens: cfg.replayMaxTokens,
         compactAfterMinutes: cfg.compactAfterMinutes,
+        compactEnabled: cfg.compactEnabled,
+        sessionCompact: cfg.sessionCompact,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,
         routes: cfg.routes,
@@ -905,12 +936,19 @@ export function apply(ctx) {
               send(res, 400, { error: 'session required' });
               return;
             }
-            if (typeof payload.enabled !== 'boolean') {
-              send(res, 400, { error: 'enabled must be a boolean' });
+            const hasEnabled = payload.enabled !== undefined;
+            const hasCompact = payload.compact !== undefined;
+            if (!hasEnabled && !hasCompact) {
+              send(res, 400, { error: 'enabled or compact required' });
               return;
             }
-            setSessionEnabledOf(sessionId, payload.enabled);
-            send(res, 200, { ok: true, session: sessionId, enabled: sessionEnabledOf(sessionId) });
+            if ((hasEnabled && typeof payload.enabled !== 'boolean') || (hasCompact && typeof payload.compact !== 'boolean')) {
+              send(res, 400, { error: 'enabled and compact must be booleans' });
+              return;
+            }
+            if (hasEnabled) setSessionEnabledOf(sessionId, payload.enabled);
+            if (hasCompact) setSessionCompactOf(sessionId, payload.compact);
+            send(res, 200, { ok: true, session: sessionId, enabled: sessionEnabledOf(sessionId), compact: compactEnabledOf(sessionId) });
           } catch (error) {
             send(res, 400, { error: String(error?.message ?? error) });
           }

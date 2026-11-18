@@ -156,6 +156,14 @@ window.__ModuleLoader__.load({
               h('code', { style: { fontSize: 12 } }, config.routes && config.routes.length > 0 ? config.routes.map((r) => r.provider + ' / ' + r.model).join('，') : '跟随当前会话模型')
             ),
             h('div', { style: row },
+              h('span', { style: label }, '空闲后自动压缩'),
+              h('button', { style: { ...button, fontWeight: 600, borderColor: 'currentColor' }, disabled: busy || state === null, onClick: () => post({ compactEnabled: !(config.compactEnabled === true) }) }, config.compactEnabled === true ? '新会话默认开' : '新会话默认关'),
+              h('span', { style: label }, '保活期间空闲满'),
+              h('input', { style: input, type: 'number', min: 5, max: 120, value: config.compactAfterMinutes ?? '', onChange: (e) => edit('compactAfterMinutes', Number(e.target.value)) }),
+              h('span', { style: label }, '分钟（5–120）压缩一次，随后停止保活'),
+              h('span', { style: { ...label, opacity: 0.55 } }, '每个窗口用回复框的「压缩」按钮单独开关；需该窗口保活已开')
+            ),
+            h('div', { style: row },
               h('span', { style: label }, '间隔'),
               h('input', { style: input, type: 'number', min: 1, value: config.intervalMinutes ?? '', onChange: (e) => edit('intervalMinutes', Number(e.target.value)) }),
               h('span', { style: label }, '分钟'),
@@ -175,7 +183,8 @@ window.__ModuleLoader__.load({
                   intervalMinutes: Number(config.intervalMinutes),
                   maxIdleMinutes: Number(config.maxIdleMinutes),
                   maxTouches: Number(config.maxTouches),
-                  replayMaxTokens: Number(config.replayMaxTokens)
+                  replayMaxTokens: Number(config.replayMaxTokens),
+                  compactAfterMinutes: Number(config.compactAfterMinutes)
                 })
               }, '保存')
             ),
@@ -453,6 +462,31 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (pending !== null && stored === pending) setPending(null);
         }, [pending, stored]);
+        // Per-window compaction switch (same explicit-then-default rule as keep-alive).
+        const [compactPending, setCompactPending] = React.useState(null);
+        const compactExplicit = config && config.sessionCompact && Object.prototype.hasOwnProperty.call(config.sessionCompact, sessionId)
+          ? config.sessionCompact[sessionId] === true
+          : null;
+        const compactStored = config === null ? null : compactExplicit === null ? config.compactEnabled === true : compactExplicit;
+        const compactOn = compactPending === null ? compactStored : compactPending;
+        React.useEffect(() => {
+          if (compactPending !== null && compactStored === compactPending) setCompactPending(null);
+        }, [compactPending, compactStored]);
+        const toggleCompact = async () => {
+          if (compactOn === null || typeof sessionId !== 'string' || sessionId.length === 0) return;
+          const next = !compactOn;
+          setCompactPending(next);
+          try {
+            const res = await fetch(API + '/session', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ session: sessionId, compact: next })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+          } catch {
+            setCompactPending(null);
+          }
+        };
         // The card must survive the pointer travelling from the pill onto it.
         React.useEffect(() => () => {
           if (hideTimer.current !== null) clearTimeout(hideTimer.current);
@@ -547,8 +581,45 @@ window.__ModuleLoader__.load({
           h('span', { style: { opacity: enabled === true ? 1 : 0.6 } }, missing ? '保活?' : '保活')
         );
 
-        if (!canFloat || missing) return pill;
-        return h('span', {
+        const compactMinutes = (config && config.compactAfterMinutes) || 20;
+        const compactDim = missing || enabled !== true;
+        const compactPill = missing ? null : h('button', {
+          type: 'button',
+          'data-plugin': 'cache-keepalive-compact-toggle',
+          title: enabled !== true
+            ? '空闲自动压缩：需要先开启本窗口的「保活」'
+            : compactOn
+              ? '空闲自动压缩：已开启（保活期间空闲满 ' + compactMinutes + ' 分钟压缩一次并停止保活），点击关闭'
+              : '空闲自动压缩：已关闭，点击开启（空闲满 ' + compactMinutes + ' 分钟压缩一次）',
+          'aria-label': '空闲自动压缩开关（仅本会话）',
+          disabled: compactOn === null || enabled !== true,
+          onClick: toggleCompact,
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            flex: '0 0 auto',
+            whiteSpace: 'nowrap',
+            writingMode: 'horizontal-tb',
+            padding: '2px 9px',
+            margin: '0 4px 0 0',
+            color: 'inherit',
+            background: compactOn === true && !compactDim ? 'rgba(217,150,0,0.12)' : 'transparent',
+            border: '1px solid ' + (compactOn === true && !compactDim ? 'rgba(217,150,0,0.5)' : 'rgba(127,127,127,0.3)'),
+            borderRadius: 999,
+            cursor: compactDim ? 'default' : 'pointer',
+            font: 'inherit',
+            fontSize: 12,
+            lineHeight: 1.5,
+            opacity: compactDim ? 0.4 : compactOn === true ? 1 : 0.65
+          }
+        },
+          h('span', { style: { width: 6, height: 6, borderRadius: '50%', background: compactOn === true && !compactDim ? '#d99600' : 'rgba(127,127,127,0.55)', display: 'inline-block', flex: '0 0 auto' } }),
+          h('span', null, compactOn === true ? '压缩 ' + compactMinutes + 'm' : '压缩')
+        );
+
+        if (!canFloat || missing) return h(React.Fragment, null, pill, compactPill);
+        const keepAlivePill = h('span', {
           style: { display: 'inline-flex', alignItems: 'center', flex: '0 0 auto', whiteSpace: 'nowrap' },
           onMouseEnter: openTip,
           onMouseLeave: closeTip,
@@ -565,6 +636,7 @@ window.__ModuleLoader__.load({
             onLeave: closeTip
           })
         );
+        return h(React.Fragment, null, keepAlivePill, compactPill);
       }
 
       return {
