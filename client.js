@@ -672,6 +672,14 @@ window.__ModuleLoader__.load({
         return oval(keepAlivePill, divider, compactPill);
       }
 
+      // Page body of the Cmd+, Settings section: the same card as the Plugins page, in page view.
+      function KeepaliveSettingsSection() {
+        return h('div', { style: { padding: '4px 4px 24px', maxWidth: 820 }, 'data-plugin': 'cache-keepalive-section' },
+          h('h2', { style: { margin: '0 0 4px', fontSize: 18, fontWeight: 600, color: 'var(--dsw-alias-label-primary, inherit)' } }, '缓存保活'),
+          h('p', { style: { margin: '0 0 12px', fontSize: 12, color: 'var(--dsw-alias-label-secondary, inherit)' } }, '空闲时自动重放最近一次请求，保持提示词缓存有效；可选空闲后自动压缩。每个对话窗口在输入框旁单独开关。'),
+          h(StatusCard, { view: 'page' }));
+      }
+
       return {
         inject: ['slots'],
         apply(ctx) {
@@ -693,7 +701,19 @@ window.__ModuleLoader__.load({
                 return undefined;
               }
             });
-            // Also list the same card on the Plugins page of the Settings (Cmd+,) as its own entry.
+            ctx.slots.inject('settings.section', () => {
+              try {
+                report('section-slot-inject');
+                return ctx.slots.register(
+                  { name: 'settings.section', id: 'cache-keepalive', order: 40, label: () => '缓存保活' },
+                  KeepaliveSettingsSection
+                );
+              } catch (error) {
+                report('section-register-error', (error && error.message) || error);
+                return undefined;
+              }
+            });
+            // Also list the same card on the sidebar Plugins page (Official group) as its own entry.
             ctx.slots.inject('plugins.item', () => {
               try {
                 report('item-slot-inject');
