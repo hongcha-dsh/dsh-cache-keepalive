@@ -25,6 +25,16 @@ const TOOLS = [{ name: 'read' }];
 const SWITCH = '/plugins/cache-keepalive/session';
 const STATE = '/plugins/cache-keepalive/state';
 const TASK = '/plugins/cache-keepalive/task';
+const CONFIG_EP = '/plugins/cache-keepalive/config';
+const REAL_ABORT_TIMEOUT = AbortSignal.timeout;
+/** A stream that never yields or returns (hung upstream). */
+const HANG = { [Symbol.asyncIterator]() { return { next: () => new Promise(() => {}), return: async () => ({ done: true, value: undefined }) }; } };
+/** A stream that waits for `gate` before yielding usage. */
+async function* gatedIter(gate, usage) {
+  await gate;
+  yield { type: 'usage', usage };
+  yield { type: 'finish', reason: { kind: 'stop' } };
+}
 
 async function* iter(chunks) {
   for (const c of chunks) yield c;
@@ -35,8 +45,12 @@ const agent = (status, compaction) => ({ status, ctx: { get: (name) => (name ===
 
 let h = null;
 
-async function setup({ config = {}, agents = {}, compaction } = {}) {
-  mock.timers.enable({ apis: ['setInterval', 'Date'], now: T0 });
+async function setup({ config = {}, agents = {}, compaction, realTimers = false } = {}) {
+  if (!realTimers) {
+    mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: T0 });
+    // Node's AbortSignal.timeout uses internal timers; route it through the mocked setTimeout.
+    AbortSignal.timeout = (ms) => { const c = new AbortController(); setTimeout(() => c.abort(new Error('timeout')), ms); return c.signal; };
+  }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-test-'));
   const modPath = path.join(dir, 'index.mjs');
   fs.copyFileSync(SRC, modPath);
@@ -57,7 +71,14 @@ async function setup({ config = {}, agents = {}, compaction } = {}) {
     sessions: {},
     agents,
     routes,
-    respond: () => iter([{ type: 'usage', usage: { ...h.replayUsage } }, { type: 'finish', reason: { kind: 'stop' } }]),
+    cleanups,
+    hangFor: new Set(),
+    gate: null,
+    respond: (options) => {
+      if (h.hangFor.has(options?.sessionId)) return HANG;
+      if (h.gate !== null) return gatedIter(h.gate, { ...h.replayUsage });
+      return iter([{ type: 'usage', usage: { ...h.replayUsage } }, { type: 'finish', reason: { kind: 'stop' } }]);
+    },
     req: (o = {}) => ({ sessionId: SID, provider: CLAUDE.provider, model: CLAUDE.model, messages: MSG, tools: TOOLS, toolHistory: [], maxTokens: 4096, signal: new AbortController().signal, ...o }),
     /** Non-replay stream through the llm/stream hook chain (used for compaction-purpose requests). */
     llmStream: (options) => hooks[0](options, () => h.respond(options)),
@@ -74,11 +95,17 @@ async function setup({ config = {}, agents = {}, compaction } = {}) {
         await flush();
       }
     },
-    http: async (key, { method = 'GET', body, url } = {}) => {
+    http: async (key, { method = 'GET', body, url, headers } = {}) => {
       const handler = routes[key];
       assert.ok(handler, 'route not registered: ' + key);
+      const base = method === 'POST'
+        ? { host: '127.0.0.1:53161', 'content-type': 'application/json', 'x-keepalive': '1' }
+        : { host: '127.0.0.1:53161' };
+      const merged = { ...base, ...(headers ?? {}) };
+      for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
       const req = {
         method,
+        headers: merged,
         url: url ?? key,
         async *[Symbol.asyncIterator]() {
           if (body !== undefined) yield JSON.stringify(body);
@@ -99,6 +126,7 @@ async function setup({ config = {}, agents = {}, compaction } = {}) {
       for (const fn of cleanups.reverse()) {
         try { fn(); } catch { /* ignore */ }
       }
+      AbortSignal.timeout = REAL_ABORT_TIMEOUT;
       mock.timers.reset();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -200,7 +228,7 @@ describe('b 间隔重放', () => {
     assert.deepEqual(rep.messages, MSG);
     assert.deepEqual(rep.tools, TOOLS);
     assert.equal(rep.sessionId, SID);
-    assert.equal(rep.signal, undefined, 'signal 不应随重放转发');
+    assert.ok(rep.signal instanceof AbortSignal, '重放带 AbortSignal（60s 看门狗）');
     assert.equal(rep.purpose, undefined);
 
     let st = await h.state();
@@ -845,5 +873,372 @@ describe('i 窗口级压缩开关', () => {
     h = await setup({ config: { compactEnabled: true, sessionCompact: {} } });
     await h.real(HIT);
     assert.equal((await h.state()).windows[SID].compact, true);
+  });
+});
+
+// ---------------- j. 防 CSRF / 白名单 / 数值上限（端点） ----------------
+const S3 = 's3';
+const settle = async (n = 6) => { for (let i = 0; i < n; i++) await flush(); };
+describe('j 端点防 CSRF、白名单、上限', () => {
+  test('j1 POST 缺 content-type → 415；text/plain → 415；缺 x-keepalive → 415', async () => {
+    h = await setup({ config: { sessionEnabled: {} } });
+    let r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { 'content-type': undefined } });
+    assert.equal(r.status, 415);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { 'content-type': 'text/plain' } });
+    assert.equal(r.status, 415);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { 'x-keepalive': undefined } });
+    assert.equal(r.status, 415);
+    r = await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 3 }, headers: { 'x-keepalive': undefined } });
+    assert.equal(r.status, 415);
+    r = await h.http('/plugins/cache-keepalive/task/delete', { method: 'POST', body: { session: SID }, headers: { 'content-type': undefined } });
+    assert.equal(r.status, 415);
+    assert.equal((await h.state()).config.sessionEnabled[SID], undefined, '被拒绝的请求不得生效');
+  });
+
+  test('j2 Origin 与 Host 不同 → 403；Origin 与 Host 相同 → 200', async () => {
+    h = await setup();
+    let r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://evil.example' } });
+    assert.equal(r.status, 403);
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://127.0.0.1:9999' } });
+    assert.equal(r.status, 403, '端口不同也算跨源');
+    r = await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true }, headers: { origin: 'http://127.0.0.1:53161' } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.enabled, true);
+  });
+
+  test('j3 /config 只接受白名单字段；routes/prices/sessionEnabled 被忽略', async () => {
+    h = await setup({ config: { routes: [CLAUDE], prices: {}, sessionEnabled: {} } });
+    const r = await h.http(CONFIG_EP, {
+      method: 'POST',
+      body: { maxTouches: 7, routes: [OPUS], prices: { 'x/y': { hit: 1, input: 1, output: 1, write: 1 } }, sessionEnabled: { [SID]: true }, compactEnabled: true }
+    });
+    assert.equal(r.status, 200);
+    const cfg = (await h.state()).config;
+    assert.equal(cfg.maxTouches, 7);
+    assert.equal(cfg.compactEnabled, true, '白名单内字段生效');
+    assert.deepEqual(cfg.routes, [CLAUDE], 'routes 不得被端点改写');
+    assert.deepEqual(cfg.sessionEnabled, {}, 'sessionEnabled 不得被端点改写');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.deepEqual(onDisk.prices, {}, 'prices 不得被端点改写');
+    assert.deepEqual(onDisk.routes, [CLAUDE]);
+  });
+
+  test('j4 /config body 为数组 / 字符串 / null → 400', async () => {
+    h = await setup();
+    for (const body of [[1, 2], 'x', null]) {
+      const r = await h.http(CONFIG_EP, { method: 'POST', body });
+      assert.equal(r.status, 400, JSON.stringify(body));
+    }
+  });
+
+  test('j5 数值上限：intervalMinutes≤60、maxIdle≤1440、maxTouches≤100(整数)、replayMaxTokens≤64、maxSessions≤10', async () => {
+    h = await setup();
+    const r = await h.http(CONFIG_EP, { method: 'POST', body: { intervalMinutes: 500, maxIdleMinutes: 99999, maxTouches: 1000, replayMaxTokens: 1000, maxSessions: 50 } });
+    assert.equal(r.status, 200);
+    const cfg = (await h.state()).config;
+    assert.equal(cfg.intervalMinutes, 60);
+    assert.equal(cfg.maxIdleMinutes, 1440);
+    assert.equal(cfg.maxTouches, 100);
+    assert.equal(cfg.replayMaxTokens, 64);
+    assert.equal(cfg.maxSessions, 10);
+  });
+
+  test('j5b maxTouches 小数向下取整（2.7 → 2）', async () => {
+    h = await setup();
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 2.7 } });
+    assert.equal((await h.state()).config.maxTouches, 2);
+  });
+});
+
+// ---------------- k. 重放看门狗（60 秒） ----------------
+describe('k 重放看门狗', () => {
+  test('k1 s1 的流挂住 → 60 秒后记 error 并释放；s2 仍能重放（不被卡死）', async () => {
+    h = await setup({ config: { intervalMinutes: 10, sessionEnabled: { [SID]: true, [S2]: true } } });
+    await h.real(HIT, { sessionId: SID });  // 先插入 → 同一 tick 中先处理
+    await h.real(HIT, { sessionId: S2 });
+    h.hangFor.add(SID);
+    await h.advance(10 * MIN);               // 两者同时到期；SID 挂住
+    assert.equal(h.streamCalls.filter((o) => o.sessionId === S2).length, 0, '挂住期间 s2 尚未轮到');
+    await h.advance(61_000);                 // 60s 看门狗触发
+    const err = h.logLines().find((l) => l.kind === 'keepalive' && l.session === SID);
+    assert.ok(err, 's1 应有记录');
+    assert.equal(err.status, 'error');
+    assert.match(err.error, /timed out/);
+    const replaySignal = h.streamCalls.find((o) => o.sessionId === SID)?.signal;
+    assert.ok(replaySignal?.aborted, '看门狗应 abort 挂住的重放');
+    await h.advance(60_000);                 // 释放后 s2 在下一轮 tick 被重放（未过期）
+    assert.ok(h.streamCalls.some((o) => o.sessionId === S2), 'busy 已释放，s2 应被重放');
+  });
+});
+
+// ---------------- l. 命中判定（hit ratio ≥ 0.6） ----------------
+describe('l 命中判定', () => {
+  test('l1 部分命中（读 3000、未命中 90000）→ miss 并停止 cache-miss', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 3000, inputTokens: 90000, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    const ka = h.logLines().find((l) => l.kind === 'keepalive');
+    assert.equal(ka.status, 'miss');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'cache-miss'));
+    assert.equal((await h.state()).sessions[0].stopped, true);
+  });
+
+  test('l2 cacheWrite 计入分母：读 5000、写 5000、未命中 100 → 0.495 → miss', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 5000, inputTokens: 100, cacheWriteTokens: 5000, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'miss');
+  });
+
+  test('l3 恰好 0.6 → hit', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 6000, inputTokens: 4000, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'hit');
+    assert.equal((await h.state()).sessions[0].stopped, false);
+  });
+
+  test('l4 cacheRead 缺失（unknown）→ 停止，reason cache-unknown', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { inputTokens: 100, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'unknown');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'cache-unknown'));
+    assert.equal((await h.state()).sessions[0].stopped, true);
+    await h.advance(30 * MIN);
+    assert.equal(h.streamCalls.length, 1);
+  });
+});
+
+// ---------------- m. 过期保护（stale） ----------------
+describe('m 过期保护', () => {
+  test('m1 一次性快进 100 分钟 → 0 次重放，stopped，reason stale', async () => {
+    h = await setup();
+    await h.real(HIT);
+    mock.timers.tick(100 * MIN);
+    await settle();
+    assert.equal(h.streamCalls.length, 0);
+    assert.equal((await h.state()).sessions[0].stopped, true);
+    const stop = h.logLines().find((l) => l.kind === 'stop');
+    assert.equal(stop.reason, 'stale');
+  });
+});
+
+// ---------------- n. 重放期间的真实请求 ----------------
+describe('n 重放期间来了真实请求', () => {
+  test('n1 重放返回后只记录：不标 stopped，且 touch 为发起时编号', async () => {
+    h = await setup();
+    await h.real(HIT);
+    let release;
+    h.gate = new Promise((r) => { release = r; });
+    await h.advance(4 * MIN); // 重放发起并挂在 gate 上
+    assert.equal(h.streamCalls.length, 1);
+    await h.real(HIT); // 真实请求重新武装（gen++，touches 归零）
+    release();
+    await settle();
+    h.gate = null;
+    const ka = h.logLines().find((l) => l.kind === 'keepalive');
+    assert.equal(ka.touch, 1, 'touch 必须是发起时的编号，不被重置为 0');
+    assert.equal(ka.status, 'hit');
+    const st = (await h.state()).sessions[0];
+    assert.equal(st.stopped, false, '新一轮不得被旧重放的结果标 stopped');
+  });
+
+  test('n2 旧重放判 miss 也不停止新一轮', async () => {
+    h = await setup();
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 0, inputTokens: 5100, outputTokens: 16 }; // 重放开始时即采用
+    let release;
+    h.gate = new Promise((r) => { release = r; });
+    await h.advance(4 * MIN);
+    await h.real(HIT);
+    release();
+    await settle();
+    h.gate = null;
+    assert.equal(h.logLines().find((l) => l.kind === 'keepalive').status, 'miss');
+    assert.equal((await h.state()).sessions[0].stopped, false);
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'cache-miss'));
+  });
+});
+
+// ---------------- o. 压缩后台化 ----------------
+describe('o 压缩不占全局 busy', () => {
+  test('o1 压缩挂起时，另一会话仍照常重放', async () => {
+    const comp = { calls: 0, compactNow: () => { comp.calls += 1; return new Promise(() => {}); } };
+    h = await setup({
+      config: { sessionEnabled: { [SID]: true, [S2]: true }, sessionCompact: { [SID]: true, [S2]: false }, compactEnabled: false, compactAfterMinutes: 10, maxTouches: 15 },
+      agents: { [SID]: agent('idle', comp) },
+      compaction: comp
+    });
+    await h.real(HIT, { sessionId: S2 });
+    await h.real(HIT, { sessionId: SID });
+    await h.advance(20 * MIN);
+    assert.equal(comp.calls, 1);
+    assert.ok(h.streamCalls.filter((o) => o.sessionId === S2).length >= 4, 's2 在压缩挂起期间仍保活');
+  });
+
+  test('o2 压缩超过 10 分钟 → 记 error（compaction timed out）并释放；之后真实请求可再次武装压缩', async () => {
+    const comp = { calls: 0, compactNow: () => { comp.calls += 1; return new Promise(() => {}); } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000); // 压缩开始（挂住）
+    assert.equal(comp.calls, 1);
+    await h.advance(10 * MIN + 30_000); // 10 分钟看门狗
+    const c = h.logLines().find((l) => l.kind === 'compact');
+    assert.equal(c.status, 'error');
+    assert.match(c.error, /timed out/);
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 2, '压缩已释放（compacting 清空），可再次触发');
+  });
+
+  test('o3 压缩开着但 agent 非 idle：压缩跳过、保活照常（不被吞掉）', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('running', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(12 * MIN + 30_000);
+    assert.equal(comp.calls, 0);
+    assert.ok(h.streamCalls.length >= 3, 'agent 忙时仍按保活重放（4/8/12 分钟）');
+    assert.equal((await h.state()).sessions[0].stopped, false);
+  });
+
+  test('o4 压缩开启时 maxIdle 取 max(maxIdle, compactAfter+1)：maxIdle=5 时 agent 忙 → 到 11 分钟才 max-idle', async () => {
+    const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } };
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, maxIdleMinutes: 5 }, agents: { [SID]: agent('running', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(8 * MIN);
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'), '8 分钟时不应 max-idle');
+    await h.advance(4 * MIN + 30_000);
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'), '超过 11 分钟应 max-idle');
+  });
+});
+
+// ---------------- p. tick 顺序处理 ----------------
+describe('p tick 顺序', () => {
+  test('p1 三个会话同时到期 → 同一轮内依次全部重放', async () => {
+    h = await setup({ config: { sessionEnabled: { [SID]: true, [S2]: true, [S3]: true } } });
+    await h.real(HIT, { sessionId: SID });
+    await h.real(HIT, { sessionId: S2 });
+    await h.real(HIT, { sessionId: S3 });
+    await h.advance(4 * MIN);
+    const ids = new Set(h.streamCalls.map((o) => o.sessionId));
+    assert.equal(h.streamCalls.length, 3, '一次扫描内三个会话都应重放');
+    assert.deepEqual([...ids].sort(), [SID, S2, S3].sort());
+  });
+});
+
+// ---------------- q. inflight 计数 & purpose ----------------
+describe('q inflight 计数与 purpose', () => {
+  test('q1 同会话两个并发真实流：先结束一个，另一个仍在途 → 不重放；全部结束后才重放', async () => {
+    h = await setup();
+    await h.real(HIT);
+    const a = h.open(HIT)[Symbol.asyncIterator]();
+    const b = h.open(HIT)[Symbol.asyncIterator]();
+    await a.next(); // 开始迭代 a（计数 +1）
+    await b.next(); // 开始迭代 b（计数 +1）
+    // 结束 a
+    let x; do { x = await a.next(); } while (!x.done);
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 0, 'b 仍在途，不应重放');
+    // 结束 b
+    do { x = await b.next(); } while (!x.done);
+    await h.advance(30_000);
+    assert.equal(h.streamCalls.length, 1, '全部结束后重放');
+  });
+
+  test('q2 purpose 请求不计在途、不影响 route.proven/samples', async () => {
+    h = await setup();
+    await h.real(HIT); // 真实证明一次
+    const samplesBefore = (await h.state()).routes[0].samples;
+    const pending = h.llmStream({ sessionId: SID, provider: CLAUDE.provider, model: CLAUDE.model, messages: MSG, maxTokens: 4096, purpose: 'compaction' })[Symbol.asyncIterator]();
+    await pending.next(); // 开始迭代（若误计在途，会阻止重放）
+    await h.advance(4 * MIN);
+    assert.equal(h.streamCalls.length, 1, 'purpose 流不应阻止重放');
+    assert.equal((await h.state()).routes[0].samples, samplesBefore + 0, 'purpose 流不计入 samples（重放本身也不计）');
+    for (let i = 0; i < 5; i++) { const x = await pending.next(); if (x.done) break; }
+  });
+});
+
+// ---------------- r. 配置健壮性（热加载 / 持久化 / 300 条上限） ----------------
+describe('r 配置健壮性', () => {
+  test('r1 config.json 解析失败：热加载保留旧配置，记 config-error', async () => {
+    const origWatch = fs.watchFile; const origUnwatch = fs.unwatchFile;
+    let listener = null; let watchedWith = null; let unwatchedWith = null;
+    fs.watchFile = (p, opts, fn) => { watchedWith = fn; listener = fn; };
+    fs.unwatchFile = (p, fn) => { unwatchedWith = fn; };
+    try {
+      h = await setup({ config: { maxTouches: 7 } });
+      assert.equal((await h.state()).config.maxTouches, 7);
+      fs.writeFileSync(path.join(h.dir, 'config.json'), '{ broken json');
+      listener();
+      assert.equal((await h.state()).config.maxTouches, 7, '解析失败不得重置为默认');
+      assert.ok(h.logLines().some((l) => l.kind === 'config-error'));
+      // 具名 listener：unwatch 必须传同一个函数
+      const listenerUsed = listener;
+      h.teardown();
+      assert.equal(unwatchedWith, listenerUsed, 'teardown 时 unwatch 必须传同一 listener');
+      h = null;
+    } finally {
+      fs.watchFile = origWatch; fs.unwatchFile = origUnwatch;
+    }
+  });
+
+  test('r1b watchFile 与 unwatchFile 使用同一个具名 listener', async () => {
+    const origWatch = fs.watchFile; const origUnwatch = fs.unwatchFile;
+    let w = null; let u = null;
+    fs.watchFile = (p, opts, fn) => { w = fn; };
+    fs.unwatchFile = (p, fn) => { u = fn; };
+    try {
+      h = await setup();
+      const cleanup = h.cleanups[h.cleanups.length - 1];
+      assert.equal(typeof cleanup, 'function');
+      // the lifecycle effect is registered last (status-route effect is first)
+      cleanup();
+      assert.ok(w && u === w, 'unwatchFile 必须传入 watchFile 时的同一 listener');
+    } finally {
+      fs.watchFile = origWatch; fs.unwatchFile = origUnwatch;
+    }
+  });
+
+  test('r2 saveConfig 原子写：POST 后目录中不残留 config.json.tmp，config.json 为合法 JSON', async () => {
+    h = await setup();
+    await h.http(CONFIG_EP, { method: 'POST', body: { maxTouches: 9 } });
+    assert.equal(fs.existsSync(path.join(h.dir, 'config.json.tmp')), false);
+    const parsed = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.equal(parsed.maxTouches, 9);
+  });
+
+  test('r3 sessionEnabled 重写已有 key → 移到队尾', async () => {
+    h = await setup({ config: { sessionEnabled: { x: true, y: false } } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'x', enabled: true } });
+    assert.deepEqual(Object.keys((await h.state()).config.sessionEnabled), ['y', 'x']);
+  });
+
+  test('r4 sessionEnabled 超过 300 条：先丢 false（最旧的），活跃 true 不被挤掉', async () => {
+    const map = { a0: true };
+    for (let i = 1; i <= 299; i++) map['f' + i] = false; // 300 条，其中只有 a0 为 true
+    h = await setup({ config: { sessionEnabled: map } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'newcomer', enabled: true } });
+    const se = (await h.state()).config.sessionEnabled;
+    assert.equal(Object.keys(se).length, 300);
+    assert.equal(se.a0, true, '活跃 true 必须保留');
+    assert.equal(se.newcomer, true);
+    assert.equal(se.f1, undefined, '最旧的 false 先被丢弃');
+    assert.equal(se.f299, false);
+  });
+
+  test('r4b sessionCompact 同样的 300 条上限规则', async () => {
+    const map = { c0: true };
+    for (let i = 1; i <= 299; i++) map['g' + i] = false;
+    h = await setup({ config: { sessionCompact: map } });
+    await h.http(SWITCH, { method: 'POST', body: { session: 'newc', compact: true } });
+    const sc = (await h.state()).config.sessionCompact;
+    assert.equal(Object.keys(sc).length, 300);
+    assert.equal(sc.c0, true);
+    assert.equal(sc.newc, true);
   });
 });

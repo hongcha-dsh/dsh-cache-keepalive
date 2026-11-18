@@ -80,9 +80,14 @@ function normalizeConfig(raw) {
   if (!Number.isFinite(cfg.intervalMinutes) || cfg.intervalMinutes <= 0) cfg.intervalMinutes = DEFAULTS.intervalMinutes;
   if (!Number.isFinite(cfg.maxIdleMinutes) || cfg.maxIdleMinutes <= 0) cfg.maxIdleMinutes = DEFAULTS.maxIdleMinutes;
   if (!Number.isFinite(cfg.maxTouches) || cfg.maxTouches < 1) cfg.maxTouches = DEFAULTS.maxTouches;
+  cfg.intervalMinutes = Math.min(cfg.intervalMinutes, 60);
+  cfg.maxIdleMinutes = Math.min(cfg.maxIdleMinutes, 1440);
+  cfg.maxTouches = Math.min(Math.floor(cfg.maxTouches), 100);
   if (!Number.isFinite(cfg.replayMaxTokens) || cfg.replayMaxTokens < 1) cfg.replayMaxTokens = DEFAULTS.replayMaxTokens;
+  cfg.replayMaxTokens = Math.min(Math.floor(cfg.replayMaxTokens), 64);
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
   if (!Number.isFinite(cfg.maxSessions) || cfg.maxSessions < 1) cfg.maxSessions = DEFAULTS.maxSessions;
+  cfg.maxSessions = Math.min(Math.floor(cfg.maxSessions), 10);
   const compact = Number(cfg.compactAfterMinutes);
   cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : DEFAULTS.compactAfterMinutes;
   cfg.compactEnabled = cfg.compactEnabled === true;
@@ -106,17 +111,26 @@ function normalizeConfig(raw) {
   return cfg;
 }
 
+/** Missing file -> defaults. A file that exists but cannot be parsed -> null, so callers keep the config they already have. */
 function loadConfig() {
+  let raw;
   try {
-    return normalizeConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
+    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
   } catch {
     return normalizeConfig(DEFAULTS);
+  }
+  try {
+    return normalizeConfig(JSON.parse(raw));
+  } catch {
+    return null;
   }
 }
 
 function saveConfig(cfg) {
   const normalized = normalizeConfig(cfg);
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalized, null, 2) + '\n');
+  const tmp = CONFIG_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(normalized, null, 2) + '\n');
+  fs.renameSync(tmp, CONFIG_PATH);
   return normalized;
 }
 
@@ -128,17 +142,32 @@ function appendLog(record) {
   }
 }
 
+/** A replay is a tiny request; anything slower than this is hung, and must not hold the lock. */
+const REPLAY_TIMEOUT_MS = 60_000;
+/** Share of the replayed prompt that must come from cache to count as a hit. */
+const HIT_RATIO = 0.6;
+
+/** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'maxTouches', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions', 'agents', 'commands'];
 
 export function apply(ctx) {
-  let cfg = loadConfig();
+  let cfg = loadConfig() ?? normalizeConfig(DEFAULTS);
   /** sessionId -> { snapshot, lastRealAt, touches, nextDueAt, stopped } */
   const sessions = new Map();
   /** replay option objects created by this plugin: never captured, never observed. */
   const replaying = new WeakSet();
   /** sessionIds with a real model stream in flight. */
-  const inflight = new Set();
+  const inflightCounts = new Map();
+  const inflight = {
+    add(id) { inflightCounts.set(id, (inflightCounts.get(id) ?? 0) + 1); },
+    delete(id) { const n = (inflightCounts.get(id) ?? 0) - 1; if (n > 0) inflightCounts.set(id, n); else inflightCounts.delete(id); },
+    has(id) { return (inflightCounts.get(id) ?? 0) > 0; }
+  };
+  /** Sessions with a compaction running (compaction runs outside the global replay lock). */
+  const compacting = new Set();
   let busy = false;
 
   // ---- status surface (settings page card) ----
@@ -336,12 +365,24 @@ export function apply(ctx) {
     if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
     return cfg.enabled === true;
   }
+  /** Insert/overwrite a switch at the tail; past 300 entries drop `false` ones first (oldest first), never an active `true` while a `false` exists. */
+  function withSwitch(source, sessionId, value) {
+    const map = { ...(source && typeof source === 'object' ? source : {}) };
+    delete map[sessionId];
+    map[sessionId] = value === true;
+    let keys = Object.keys(map);
+    if (keys.length > 300) {
+      for (const key of keys.filter((k) => map[k] !== true && k !== sessionId)) {
+        if (Object.keys(map).length <= 300) break;
+        delete map[key];
+      }
+      keys = Object.keys(map);
+      for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
+    }
+    return map;
+  }
   function setSessionEnabledOf(sessionId, enabled) {
-    const map = { ...(cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' ? cfg.sessionEnabled : {}) };
-    map[sessionId] = enabled === true;
-    const keys = Object.keys(map);
-    for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
-    cfg = saveConfig({ ...cfg, sessionEnabled: map });
+    cfg = saveConfig({ ...cfg, sessionEnabled: withSwitch(cfg.sessionEnabled, sessionId, enabled) });
     // Turning a window on starts a fresh "本次开启" epoch; turning it off drops it.
     if (enabled === true) enabledSince.set(sessionId, Date.now());
     else enabledSince.delete(sessionId);
@@ -356,11 +397,7 @@ export function apply(ctx) {
     return cfg.compactEnabled === true;
   }
   function setSessionCompactOf(sessionId, enabled) {
-    const map = { ...(cfg.sessionCompact && typeof cfg.sessionCompact === 'object' ? cfg.sessionCompact : {}) };
-    map[sessionId] = enabled === true;
-    const keys = Object.keys(map);
-    for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
-    cfg = saveConfig({ ...cfg, sessionCompact: map });
+    cfg = saveConfig({ ...cfg, sessionCompact: withSwitch(cfg.sessionCompact, sessionId, enabled) });
     appendLog({ kind: 'compact-switch', session: sessionId, enabled: enabled === true });
   }
 
@@ -593,6 +630,8 @@ export function apply(ctx) {
         touches: 0,
         nextDueAt: now + intervalFor(options.provider, options.model),
         stopped: false,
+        gen: 0,
+        lastTouchAt: now,
         title
       });
       appendLog({ kind: 'capture', session: sessionId, title, provider: options.provider, model: options.model, messages: Array.isArray(options.messages) ? options.messages.length : null, toolHistory: Array.isArray(options.toolHistory) ? options.toolHistory.length : null, tools: Array.isArray(options.tools) ? options.tools.length : null });
@@ -602,6 +641,8 @@ export function apply(ctx) {
       existing.touches = 0;
       existing.nextDueAt = now + intervalFor(options.provider, options.model);
       existing.stopped = false;
+      existing.gen = (existing.gen ?? 0) + 1;
+      existing.lastTouchAt = now;
       if (title !== null && title.length > 0) existing.title = title;
     }
     prune();
@@ -638,9 +679,9 @@ export function apply(ctx) {
     })();
   }
 
-  function buildReplayOptions(snapshot) {
+  function buildReplayOptions(snapshot, signal) {
     const { signal: _ignored, ...rest } = snapshot;
-    const options = { ...rest, maxTokens: cfg.replayMaxTokens };
+    const options = { ...rest, maxTokens: cfg.replayMaxTokens, signal };
     replaying.add(options);
     return options;
   }
@@ -665,31 +706,45 @@ export function apply(ctx) {
     return { via: 'command', kind: result.kind ?? 'unknown', text: result.text ?? '' };
   }
 
+  /** Reject when `signal` aborts, so a call that ignores its signal still cannot hold a lock forever. */
+  function abortRace(signal, message) {
+    return new Promise((_, reject) => {
+      if (signal.aborted) reject(new Error(message));
+      else signal.addEventListener('abort', () => reject(new Error(message)), { once: true });
+    });
+  }
+
   /**
    * Idle long enough: compact once through the official backend, then stop keeping
    * this session alive. The entry is marked stopped BEFORE the call, so a failure or
    * a no-op can never retrigger; the next real request re-captures and re-arms it.
-   * Never runs while the agent is not idle or a model stream is in flight.
+   * Returns false (nothing started, keep-alive carries on) while the agent is not
+   * idle or a model stream is in flight. Runs outside the global replay lock, so a
+   * slow compaction never delays other sessions' keep-alive.
    */
-  async function compactIdle(sessionId, entry) {
+  function startCompaction(sessionId, entry) {
     const agent = ctx.agents.get(sessionId);
     if (agent === undefined) {
       entry.stopped = true;
       appendLog({ kind: 'compact', session: sessionId, status: 'skipped', reason: 'no-agent' });
-      return;
+      return true;
     }
-    if (agent.status !== 'idle' || inflight.has(sessionId)) return;
-    busy = true;
+    if (agent.status !== 'idle' || inflight.has(sessionId) || compacting.has(sessionId)) return false;
+    compacting.add(sessionId);
     entry.stopped = true;
     const idleMinutes = +((Date.now() - entry.lastRealAt) / 60000).toFixed(1);
-    try {
-      const result = await runCompaction(agent, AbortSignal.timeout(10 * 60_000));
-      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: result.kind, via: result.via, text: result.text, idleMinutes, touches: entry.touches });
-    } catch (error) {
-      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'error', error: String(error?.message ?? error), idleMinutes, touches: entry.touches });
-    } finally {
-      busy = false;
-    }
+    const signal = AbortSignal.timeout(10 * 60_000);
+    void (async () => {
+      try {
+        const result = await Promise.race([runCompaction(agent, signal), abortRace(signal, 'compaction timed out')]);
+        appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: result.kind, via: result.via, text: result.text, idleMinutes, touches: entry.touches });
+      } catch (error) {
+        appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'error', error: String(error?.message ?? error), idleMinutes, touches: entry.touches });
+      } finally {
+        compacting.delete(sessionId);
+      }
+    })();
+    return true;
   }
 
   async function replay(sessionId, entry) {
@@ -701,10 +756,7 @@ export function apply(ctx) {
     if (busy) return;
     if (entry.stopped) return;
     const compactOn = compactEnabledOf(sessionId);
-    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000) {
-      await compactIdle(sessionId, entry);
-      return;
-    }
+    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && startCompaction(sessionId, entry)) return;
     // With compaction on for this window, the compaction itself ends the idle gap; the touch cap only guards the compaction-off case.
     if (!compactOn && entry.touches >= cfg.maxTouches) {
       entry.stopped = true;
@@ -712,7 +764,9 @@ export function apply(ctx) {
       return;
     }
     const now = Date.now();
-    if (now - entry.lastRealAt > cfg.maxIdleMinutes * 60_000) {
+    // With compaction on, the idle cap must leave room for the compaction to happen first.
+    const idleCapMinutes = compactOn ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
+    if (now - entry.lastRealAt > idleCapMinutes * 60_000) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-idle', idleMinutes: +((now - entry.lastRealAt) / 60000).toFixed(1) });
       return;
@@ -720,6 +774,15 @@ export function apply(ctx) {
     if (now < entry.nextDueAt) return;
     if (inflight.has(sessionId)) return;
     if (entry.snapshot === undefined) return;
+    // The cache is refreshed from the START of the last request; if we are already well past
+    // the replay interval (machine slept, clock jumped, queue backed up) it has probably expired
+    // and a replay would only pay for a full rewrite. Stop instead of spending.
+    const sinceTouch = now - (entry.lastTouchAt ?? entry.lastRealAt);
+    if (sinceTouch > intervalFor(entry.snapshot.provider, entry.snapshot.model) * 1.25) {
+      entry.stopped = true;
+      appendLog({ kind: 'stop', session: sessionId, reason: 'stale', sinceTouchMinutes: +(sinceTouch / 60000).toFixed(1) });
+      return;
+    }
     if (cfg.requireProvenCache !== false && !routeState(entry.snapshot.provider, entry.snapshot.model).proven) {
       // No real request on this route has shown a cache hit yet: don't spend on it.
       return;
@@ -727,40 +790,58 @@ export function apply(ctx) {
 
     busy = true;
     entry.touches += 1;
-    entry.nextDueAt = now + intervalFor(entry.snapshot.provider, entry.snapshot.model);
+    const touch = entry.touches;
+    const gen = entry.gen ?? 0;
+    const snapshot = entry.snapshot;
+    entry.lastTouchAt = now;
+    entry.nextDueAt = now + intervalFor(snapshot.provider, snapshot.model);
     const title = sessionTitle(sessionId) ?? entry.title ?? storedTitles.get(sessionId) ?? null;
     if (title !== null) entry.title = title;
     const startedAt = Date.now();
     let usage = null;
     let finishReason = null;
+    const abort = new AbortController();
+    const watchdog = setTimeout(() => abort.abort(), REPLAY_TIMEOUT_MS);
     try {
-      const options = buildReplayOptions(entry.snapshot);
-      for await (const chunk of ctx.llm.stream(options)) {
-        if (chunk === null || typeof chunk !== 'object') continue;
-        if (chunk.type === 'usage') usage = chunk.usage ?? usage;
-        else if (chunk.type === 'finish') finishReason = chunk.reason ?? finishReason;
-      }
+      const options = buildReplayOptions(snapshot, abort.signal);
+      const consume = async () => {
+        for await (const chunk of ctx.llm.stream(options)) {
+          if (chunk === null || typeof chunk !== 'object') continue;
+          if (chunk.type === 'usage') usage = chunk.usage ?? usage;
+          else if (chunk.type === 'finish') finishReason = chunk.reason ?? finishReason;
+        }
+      };
+      await Promise.race([consume(), abortRace(abort.signal, 'replay timed out')]);
     } catch (error) {
       busy = false;
-      entry.stopped = true;
-      appendLog({ kind: 'keepalive', session: sessionId, title, provider: entry.snapshot.provider, model: entry.snapshot.model, touch: entry.touches, status: 'error', error: String(error?.message ?? error) });
+      if ((entry.gen ?? 0) === gen) entry.stopped = true;
+      appendLog({ kind: 'keepalive', session: sessionId, title, provider: snapshot.provider, model: snapshot.model, touch, status: 'error', error: String(error?.message ?? error) });
       return;
+    } finally {
+      clearTimeout(watchdog);
     }
     busy = false;
 
     const cacheRead = usage?.cacheReadTokens ?? usage?.cacheRead ?? null;
     const input = usage?.inputTokens ?? usage?.input ?? null;
     const output = usage?.outputTokens ?? usage?.output ?? null;
+    const cacheWrite = usage?.cacheWriteTokens ?? usage?.cacheWrite ?? 0;
     const failed = finishReason !== null && typeof finishReason === 'object' && finishReason.kind === 'error';
-    const status = failed ? 'error' : cacheRead === null ? 'unknown' : cacheRead > 0 ? 'hit' : 'miss';
+    // A genuine hit reads (nearly) the whole prompt from cache. A small read next to a large
+    // uncached/rewritten remainder means the replay diverged from the real request: that is a
+    // miss, and repeating it would rewrite the prefix every interval.
+    const promptTokens = (cacheRead ?? 0) + (input ?? 0) + cacheWrite;
+    const status = failed ? 'error'
+      : cacheRead === null ? 'unknown'
+        : cacheRead > 0 && promptTokens > 0 && cacheRead / promptTokens >= HIT_RATIO ? 'hit' : 'miss';
     const record = {
       ts: new Date().toISOString(),
       kind: 'keepalive',
       session: sessionId,
       title,
-      provider: entry.snapshot.provider,
-      model: entry.snapshot.model,
-      touch: entry.touches,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      touch,
       status,
       cacheRead,
       input,
@@ -772,27 +853,38 @@ export function apply(ctx) {
     remember(record);
     if (title !== null) storedTitles.set(sessionId, title);
     addToStats(record);
+    // A real request arrived while this replay was in flight: it re-armed the entry, so this
+    // (now stale) result is recorded but must not stop the new idle gap.
+    if ((entry.gen ?? 0) !== gen) return;
     if (failed) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'replay-error' });
-    } else if (cacheRead === 0) {
+    } else if (status === 'miss' || status === 'unknown') {
       entry.stopped = true;
-      appendLog({ kind: 'stop', session: sessionId, reason: 'cache-miss' });
+      appendLog({ kind: 'stop', session: sessionId, reason: status === 'miss' ? 'cache-miss' : 'cache-unknown' });
     }
   }
 
-  function tick() {
-    if (sessions.size === 0) return;
-    const entries = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt).slice(0, cfg.maxSessions);
-    for (const [sessionId, entry] of entries) {
-      if (!sessionEnabledOf(sessionId)) {
-        sessions.delete(sessionId);
-        continue;
+  let ticking = false;
+  /** Sequential: every due session is handled in the same pass (back to back), so a later session is not pushed a whole scan interval past its TTL. */
+  async function tick() {
+    if (ticking || sessions.size === 0) return;
+    ticking = true;
+    try {
+      const entries = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt).slice(0, cfg.maxSessions);
+      for (const [sessionId, entry] of entries) {
+        if (!sessionEnabledOf(sessionId)) {
+          sessions.delete(sessionId);
+          continue;
+        }
+        try {
+          await replay(sessionId, entry);
+        } catch (error) {
+          ctx.logger?.warn?.('cache-keepalive: replay failed: ' + String(error?.message ?? error));
+        }
       }
-      void replay(sessionId, entry).catch((error) => {
-        ctx.logger?.warn?.('cache-keepalive: replay failed: ' + String(error?.message ?? error));
-      });
-      if (busy) return;
+    } finally {
+      ticking = false;
     }
   }
 
@@ -806,6 +898,8 @@ export function apply(ctx) {
     const sessionId = options?.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return raw;
     if (replaying.has(options)) return raw;
+    // Requests that carry a purpose (compaction, titles...) are not real turns: don't track them as in-flight or learn cache proof from them.
+    if (options.purpose !== undefined) return raw;
     return observe(raw, sessionId);
   });
 
@@ -879,6 +973,32 @@ export function apply(ctx) {
       res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
       res.end(body);
     };
+    /**
+     * Browsers let any web page POST a "simple" request (text/plain) to 127.0.0.1 without a
+     * preflight. Require what a cross-site form/no-cors fetch cannot send: a JSON content type
+     * plus our own header (both force a preflight we never answer), and a same-origin Origin.
+     */
+    const guardPost = (req, res) => {
+      const header = (name) => String(req.headers?.[name] ?? '');
+      const origin = header('origin');
+      if (origin !== '') {
+        let originHost = '';
+        try {
+          originHost = new URL(origin).host;
+        } catch {
+          originHost = '';
+        }
+        if (originHost !== header('host')) {
+          send(res, 403, { error: 'cross-origin request rejected' });
+          return false;
+        }
+      }
+      if (!/^application\/json\b/i.test(header('content-type')) || header('x-keepalive') !== '1') {
+        send(res, 415, { error: 'application/json with X-Keepalive: 1 required' });
+        return false;
+      }
+      return true;
+    };
     const readBody = async (req, limit) => {
       let body = '';
       for await (const chunk of req) {
@@ -909,9 +1029,13 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 16384);
-            const patch = body.length === 0 ? {} : JSON.parse(body);
+            const raw = body.length === 0 ? {} : JSON.parse(body);
+            if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config patch must be an object');
+            const patch = {};
+            for (const key of CONFIG_PATCH_KEYS) if (Object.prototype.hasOwnProperty.call(raw, key)) patch[key] = raw[key];
             cfg = saveConfig({ ...cfg, ...patch });
             appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
             send(res, 200, { ok: true, config: cfg });
@@ -928,6 +1052,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const payload = body.length === 0 ? {} : JSON.parse(body);
@@ -1007,6 +1132,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const payload = body.length === 0 ? {} : JSON.parse(body);
@@ -1088,11 +1214,9 @@ export function apply(ctx) {
   ctx.effect(function* keepaliveLifecycle() {
     appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
     const timer = setInterval(() => {
-      try {
-        tick();
-      } catch (error) {
+      tick().catch((error) => {
         ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
-      }
+      });
     }, cfg.scanSeconds * 1000);
     timer.unref?.();
 
@@ -1102,9 +1226,13 @@ export function apply(ctx) {
     } catch {
       lastMtime = 0;
     }
-    fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
+    const onConfigChange = () => {
       try {
         const next = loadConfig();
+        if (next === null) {
+          appendLog({ kind: 'config-error', error: 'config.json is not valid JSON; keeping the previous settings' });
+          return;
+        }
         const changed = JSON.stringify(next) !== JSON.stringify(cfg);
         cfg = next;
         if (changed) {
@@ -1113,12 +1241,13 @@ export function apply(ctx) {
       } catch {
         /* keep previous config */
       }
-    });
+    };
+    fs.watchFile(CONFIG_PATH, { interval: 2000 }, onConfigChange);
 
     yield () => {
       clearInterval(timer);
       try {
-        fs.unwatchFile(CONFIG_PATH);
+        fs.unwatchFile(CONFIG_PATH, onConfigChange);
       } catch {
         /* already gone */
       }

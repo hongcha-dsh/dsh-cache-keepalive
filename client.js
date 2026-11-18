@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
       try {
         fetch('/plugins/cache-keepalive/clientlog', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
           body: JSON.stringify({ stage, detail: detail === undefined ? '' : String(detail) }),
           keepalive: true
         }).catch(() => {});
@@ -25,10 +25,10 @@ window.__ModuleLoader__.load({
       const h = React.createElement;
       const API = '/plugins/cache-keepalive';
 
-      const label = { fontSize: 12, opacity: 0.65 };
+      const label = { fontSize: 12, color: 'var(--dsw-alias-label-secondary, inherit)' };
       const row = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' };
       const box = { display: 'flex', flexDirection: 'column', gap: 10, padding: '4px 0 8px' };
-      const card = { border: '1px solid rgba(127,127,127,0.28)', borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 };
+      const card = { border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.28))', borderRadius: 'var(--dsw-radius-md, 8px)', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 };
       const grid = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8 };
       const input = { width: 76, padding: '2px 6px', color: 'inherit', background: 'transparent', border: '1px solid rgba(127,127,127,0.35)', borderRadius: 6, font: 'inherit' };
       const button = { padding: '3px 12px', color: 'inherit', background: 'transparent', border: '1px solid rgba(127,127,127,0.45)', borderRadius: 6, cursor: 'pointer', font: 'inherit' };
@@ -101,6 +101,14 @@ window.__ModuleLoader__.load({
           if (pendingEnabled !== null && state !== null && state.enabled === pendingEnabled) setPendingEnabled(null);
         }, [state, pendingEnabled]);
 
+        if (view === 'summary') {
+          if (state === null) return h('span', null, error ? '状态接口不可用' : '读取中…');
+          const on = state.sessions ? state.sessions.filter((x) => x.enabled).length : 0;
+          const st = state.stats || {};
+          return h('span', null, '空闲时自动重放请求保持提示词缓存'
+            + (on > 0 ? ' · 保活中 ' + on + ' 个窗口' : ' · 暂无保活中的窗口')
+            + (st.touches ? ' · 累计 ' + st.touches + ' 次，估算净省 ' + money(st.savedEstimate) : ''));
+        }
         if (view !== 'page') return null;
 
         const post = async (patch) => {
@@ -108,7 +116,7 @@ window.__ModuleLoader__.load({
           try {
             const res = await fetch(API + '/config', {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
               body: JSON.stringify(patch)
             });
             const json = await res.json();
@@ -249,7 +257,7 @@ window.__ModuleLoader__.load({
           try {
             const res = await fetch(API + '/task/delete', {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
               body: JSON.stringify({ session: id })
             });
             const json = await res.json();
@@ -447,7 +455,7 @@ window.__ModuleLoader__.load({
       // ONLY the conversation it renders in: the Host stores a per-session switch,
       // so toggling one window never changes another.
       function ComposerButton({ sessionId }) {
-        const { state } = useStatus();
+        const { state, refresh } = useStatus();
         const [busy, setBusy] = React.useState(false);
         const [pending, setPending] = React.useState(null);
         const [tip, setTip] = React.useState(null);
@@ -464,6 +472,7 @@ window.__ModuleLoader__.load({
         }, [pending, stored]);
         // Per-window compaction switch (same explicit-then-default rule as keep-alive).
         const [compactPending, setCompactPending] = React.useState(null);
+        const compactBusy = React.useRef(false);
         const compactExplicit = config && config.sessionCompact && Object.prototype.hasOwnProperty.call(config.sessionCompact, sessionId)
           ? config.sessionCompact[sessionId] === true
           : null;
@@ -473,18 +482,23 @@ window.__ModuleLoader__.load({
           if (compactPending !== null && compactStored === compactPending) setCompactPending(null);
         }, [compactPending, compactStored]);
         const toggleCompact = async () => {
-          if (compactOn === null || typeof sessionId !== 'string' || sessionId.length === 0) return;
+          if (compactBusy.current || compactOn === null || typeof sessionId !== 'string' || sessionId.length === 0) return;
+          compactBusy.current = true;
           const next = !compactOn;
           setCompactPending(next);
           try {
             const res = await fetch(API + '/session', {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
               body: JSON.stringify({ session: sessionId, compact: next })
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
+            await refresh();
+            setCompactPending(null);
           } catch {
             setCompactPending(null);
+          } finally {
+            compactBusy.current = false;
           }
         };
         // The card must survive the pointer travelling from the pill onto it.
@@ -526,10 +540,14 @@ window.__ModuleLoader__.load({
           try {
             const res = await fetch(API + '/session', {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
               body: JSON.stringify({ session: sessionId, enabled: next })
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
+            // Re-read the server's value and drop the optimistic one either way, so a
+            // value the server did not adopt can never leave the pill stuck on "pending".
+            await refresh();
+            setPending(null);
           } catch {
             setPending(null);
           } finally {
