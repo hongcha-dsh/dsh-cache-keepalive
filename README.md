@@ -13,8 +13,47 @@ The replay never writes the session, never enters the chat and never executes to
 Prompt caches expire: Kimi's after tens of minutes, Anthropic's after 5. A conversation that goes
 quiet and resumes pays a full cache write for the whole prefix. A replay every few minutes costs one
 cache read of the same prefix, which is 10-40x cheaper than the rewrite it prevents - as long as you
-stop before the replays add up to more than the rewrite. See [docs/ECONOMICS.md](docs/ECONOMICS.md)
-for the numbers (break-even, per-idle-time savings, a measured run, worst-case spend).
+stop before the replays add up to more than the rewrite. The savings arithmetic is below;
+[docs/ECONOMICS.md](docs/ECONOMICS.md) has the full tables.
+
+## How much it saves (the math)
+
+Anthropic-style cache, 5-minute TTL, refreshed by every request that reads it. For a context of `C`
+tokens, with per-million-token prices `hit` (cache read), `write` (5-minute cache write) and `out`:
+
+- one replay costs `C·hit + 16·out` (it reads the whole prefix and emits at most 16 tokens);
+- if the cache expires, the next real request pays `C·write` instead of `C·hit`: an **extra** `C·(write − hit)`;
+- so keeping it alive pays off for up to `k* = (write − hit) / hit` replays. At one replay every
+  4 minutes that is `4·k*` minutes.
+
+The relay's cache-write price is unpublished, so two assumptions are shown (¥ per million tokens):
+
+| | hit | write | `k*` | `4·k*` |
+|---|---|---|---|---|
+| A. relay list (Claude-Sonnet-5.5; read 0.1× input, write assumed 1.25× input) | 0.1944 | 2.4306 | 11.5 | ≈ 46 min |
+| B. Anthropic list (read 0.05×, write 1.25× of $2/M, at ¥6.667/$) | 0.667 | 16.67 | 23.9 | ≈ 95 min |
+
+That is why the max keep-alive duration defaults to **45 min**: 11 replays at a 4-minute interval, below
+break-even under both assumptions, so a conversation that goes quiet never costs more than letting its
+cache expire.
+
+One 300k-token conversation, user comes back after:
+
+| idle | replays | replay spend (A) | avoided rewrite (A) | net (A) | net (B) |
+|---|---|---|---|---|---|
+| 6 min | 1 | ¥0.058 | ¥0.671 | **+¥0.61** (91 %) | +¥4.60 (96 %) |
+| 20 min | 5 | ¥0.292 | ¥0.671 | **+¥0.38** (56 %) | +¥3.80 (79 %) |
+| 45 min | 11 | ¥0.643 | ¥0.671 | +¥0.03 (4 %) | +¥2.59 (54 %) |
+| 60 min | 15 | ¥0.877 | ¥0.671 | −¥0.21 | +¥1.78 |
+
+The negative rows are what the duration cap prevents: past break-even the plugin stops by itself.
+
+Measured with this plugin on real conversations (2026-11-18): 11 / 11 replays hit the cache, ¥0.415
+spent against ¥2.81 of avoided rewrites under A (**6.8× return**), ¥1.43 against ¥20.11 under B
+(**14.1×**). Worst case: 3 conversations × 11 replays, none of which ever comes back, is about ¥1.9 under
+A; the hit-ratio check and the stale guard (below) can stop it sooner.
+
+All figures are estimates from list prices, not a bill.
 
 Measured on kimi (2026-11-11, direct API, 10k-token unique prefixes):
 
