@@ -45,7 +45,7 @@ const agent = (status, compaction) => ({ status, ctx: { get: (name) => (name ===
 
 let h = null;
 
-async function setup({ config = {}, agents = {}, compaction, realTimers = false } = {}) {
+async function setup({ config = {}, agents = {}, compaction, realTimers = false, noWaterfall = false } = {}) {
   if (!realTimers) {
     mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: T0 });
     // Node's AbortSignal.timeout uses internal timers; route it through the mocked setTimeout.
@@ -69,6 +69,9 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     streamCalls: [],
     commandCalls: [],
     commandResult: undefined,
+    activity: [],
+    activityError: null,
+    activityCalls: [],
     sessions: {},
     agents,
     routes,
@@ -159,6 +162,14 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false 
     },
     llm: { stream: (options) => h.llmStream(options) },
     agents: { get: (id) => h.agents[id] },
+    /** `workspace/session-activity`: what still runs for a session (h.activity), or a failure (h.activityError). */
+    ...(noWaterfall ? {} : {
+      waterfall: async (name, request, fallback) => {
+        h.activityCalls.push({ name, request });
+        if (h.activityError !== null) throw h.activityError;
+        return name === 'workspace/session-activity' ? h.activity : fallback();
+      }
+    }),
     commands: {
       execute: async (agentObj, name, args) => {
         h.commandCalls.push({ agent: agentObj, name, args });
@@ -1879,5 +1890,116 @@ describe('v3 压缩倒计时状态（windows.compactStatus）', () => {
     const st = await h.state();
     assert.equal(st.windows[SID].compactStatus, 'stopped');
     assert.equal(st.windows[SID].lastCompaction, null);
+  });
+});
+
+// ---------------- w. 后台任务 / 子 agent 运行中不压缩 ----------------
+describe('w 运行中的任务不被压缩（compactSkipWhenBusy）', () => {
+  const mkComp = () => { const comp = { calls: 0, compactNow: async () => { comp.calls += 1; return { shadowedTokenCount: 1 }; } }; return comp; };
+  const cfg = (extra = {}) => ({ compactEnabled: true, compactAfterMinutes: 10, maxIdleMinutes: 60, ...extra });
+
+  test('w1 有 job 在跑 → 暂缓、保活继续；任务结束后在下一轮扫描压缩；日志只记一条', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activity = [{ kind: 'job', items: [{ id: 'bash-1', label: 'sleep' }] }];
+    await h.real(HIT);
+    await h.advance(20 * MIN);
+    assert.equal(comp.calls, 0, '有后台任务时不压缩');
+    assert.ok(h.streamCalls.length >= 3, '保活继续');
+    assert.equal((await h.state()).sessions[0].stopped, false);
+    const postponed = h.logLines().filter((l) => l.kind === 'compact' && l.status === 'postponed');
+    assert.equal(postponed.length, 1);
+    assert.deepEqual(postponed[0].running, ['job']);
+    const win = (await h.state()).windows[SID];
+    assert.equal(win.compactStatus, 'blocked');
+    assert.deepEqual(win.compactBlockedBy, ['job']);
+    assert.equal(h.activityCalls[0].request.sessionId, SID);
+
+    h.activity = [];
+    await h.advance(MIN);
+    assert.equal(comp.calls, 1, '任务结束后恢复压缩');
+    assert.equal(h.logLines().filter((l) => l.kind === 'compact' && l.status === 'success').length, 1);
+  });
+
+  test('w2 子 agent 在跑同样暂缓；只有 turn 活动不算（turn 由 agent.status 管）', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activity = [{ kind: 'subagent', items: [{ id: 'c1' }] }];
+    await h.real(HIT);
+    await h.advance(12 * MIN);
+    assert.equal(comp.calls, 0);
+    h.activity = [{ kind: 'turn' }];
+    await h.advance(MIN);
+    assert.equal(comp.calls, 1, '只有 turn 项时不阻塞（agent 已 idle）');
+  });
+
+  test('w2b schedule / terminal 等其他活动不阻塞（只有 job 与 subagent 阻塞）；混合时仍按 job 阻塞并只报 job', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activity = [{ kind: 'schedule', items: [{ id: 's1' }] }];
+    await h.real(HIT);
+    await h.advance(11 * MIN);
+    assert.equal(comp.calls, 1, '定时任务不阻塞压缩');
+
+    comp.calls = 0;
+    await h.real(HIT);
+    h.activity = [{ kind: 'schedule' }, { kind: 'job' }];
+    await h.advance(12 * MIN);
+    assert.equal(comp.calls, 0);
+    assert.deepEqual((await h.state()).windows[SID].compactBlockedBy, ['job']);
+  });
+
+  test('w3 compactSkipWhenBusy=false → 不查任务，照常压缩', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg({ compactSkipWhenBusy: false }), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activity = [{ kind: 'job', items: [] }];
+    await h.real(HIT);
+    await h.advance(11 * MIN);
+    assert.equal(comp.calls, 1);
+    assert.equal(h.activityCalls.length, 0);
+  });
+
+  test('w4 活动检查抛错 → 本轮暂缓（不压缩），记一条 postponed，恢复后压缩', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activityError = new Error('registry down');
+    await h.real(HIT);
+    await h.advance(15 * MIN);
+    assert.equal(comp.calls, 0);
+    const postponed = h.logLines().filter((l) => l.status === 'postponed');
+    assert.equal(postponed.length, 1);
+    assert.equal(postponed[0].reason, 'activity-check-failed');
+    h.activityError = null;
+    await h.advance(MIN);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('w5 宿主没有 waterfall（旧版本）→ 视为无任务，照常压缩', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp, noWaterfall: true });
+    await h.real(HIT);
+    await h.advance(11 * MIN);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('w6 暂缓期间来了真实请求 → 清除阻塞标记并重新计时', async () => {
+    const comp = mkComp();
+    h = await setup({ config: cfg(), agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.activity = [{ kind: 'job', items: [] }];
+    await h.real(HIT);
+    await h.advance(12 * MIN);
+    assert.equal((await h.state()).windows[SID].compactStatus, 'blocked');
+    await h.real(HIT);
+    const win = (await h.state()).windows[SID];
+    assert.equal(win.compactStatus, 'counting');
+    assert.equal(win.compactBlockedBy, null);
+  });
+
+  test('w7 开关经 /config 白名单保存与回读，默认 true', async () => {
+    h = await setup({});
+    assert.equal((await h.state()).config.compactSkipWhenBusy, true);
+    const r = await h.http(CONFIG_EP, { method: 'POST', body: { compactSkipWhenBusy: false } });
+    assert.equal(r.status, 200);
+    assert.equal((await h.state()).config.compactSkipWhenBusy, false);
   });
 });

@@ -42,6 +42,8 @@ const DEFAULTS = {
   compactEnabled: false,
   /** A manual compaction (the user's /compact) clears that window's auto-compaction countdown: the obsolete snapshot is dropped and keep-alive/compaction wait for the next real request. */
   compactResetOnManual: true,
+  /** Do not auto-compact a window while a background job or a subagent it started is still running (the agent itself is idle, so its status alone does not show it). */
+  compactSkipWhenBusy: true,
   /** sessionId -> boolean: the per-window compaction switch (needs that window's keep-alive on). */
   sessionCompact: {},
   /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
@@ -95,6 +97,7 @@ function normalizeConfig(raw) {
   cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : DEFAULTS.compactAfterMinutes;
   cfg.compactEnabled = cfg.compactEnabled === true;
   cfg.compactResetOnManual = cfg.compactResetOnManual !== false;
+  cfg.compactSkipWhenBusy = cfg.compactSkipWhenBusy !== false;
   const perSessionCompact = {};
   if (cfg.sessionCompact && typeof cfg.sessionCompact === 'object' && !Array.isArray(cfg.sessionCompact)) {
     for (const [sessionId, value] of Object.entries(cfg.sessionCompact)) {
@@ -148,11 +151,13 @@ function appendLog(record) {
 
 /** A replay is a tiny request; anything slower than this is hung, and must not hold the lock. */
 const REPLAY_TIMEOUT_MS = 60_000;
+/** `workspace/session-activity` kinds that postpone a compaction. `turn` is covered by agent.status; `schedule` (a task due later) must not block it. */
+const BLOCKING_KINDS = new Set(['job', 'subagent']);
 /** Share of the replayed prompt that must come from cache to count as a hit. */
 const HIT_RATIO = 0.9;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
-const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactSkipWhenBusy', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
 
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions'];
@@ -681,6 +686,8 @@ export function apply(ctx) {
       existing.stopped = false;
       existing.gen = (existing.gen ?? 0) + 1;
       existing.deferLogged = false;
+      existing.blockLogged = false;
+      existing.compactBlocked = undefined;
       existing.lastTouchAt = now;
       if (title !== null && title.length > 0) existing.title = title;
     }
@@ -756,6 +763,39 @@ export function apply(ctx) {
   }
 
   /**
+   * Is a background job or a subagent that belongs to this window still running? The agent is idle in that case
+   * (it ended its turn and waits for the completion notice), so `agent.status` alone cannot tell. DSH answers this
+   * through the `workspace/session-activity` waterfall (the same question it asks before archiving a session).
+   * No such event (older DSH) = nothing to check; a failed check postpones the compaction to the next scan.
+   * Records why in `entry.compactBlocked` (shown on the compaction hover card) and logs once per idle gap.
+   */
+  async function hasRunningWork(sessionId, entry) {
+    if (typeof ctx.waterfall !== 'function') return false;
+    let activity;
+    try {
+      activity = await ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]));
+    } catch (error) {
+      entry.compactBlocked = { at: Date.now(), kinds: ['unknown'] };
+      if (entry.blockLogged !== true) {
+        entry.blockLogged = true;
+        appendLog({ kind: 'compact', session: sessionId, status: 'postponed', reason: 'activity-check-failed', error: String(error?.message ?? error) });
+      }
+      return true;
+    }
+    const kinds = (Array.isArray(activity) ? activity : []).map((a) => String(a?.kind)).filter((k) => BLOCKING_KINDS.has(k));
+    if (kinds.length === 0) {
+      entry.compactBlocked = undefined;
+      return false;
+    }
+    entry.compactBlocked = { at: Date.now(), kinds };
+    if (entry.blockLogged !== true) {
+      entry.blockLogged = true;
+      appendLog({ kind: 'compact', session: sessionId, status: 'postponed', reason: 'running-work', running: kinds });
+    }
+    return true;
+  }
+
+  /**
    * Idle long enough: compact once through the official backend, then stop keeping
    * this session alive. The entry is marked stopped BEFORE the call, so a failure or
    * a no-op can never retrigger; the next real request re-captures and re-arms it.
@@ -763,7 +803,7 @@ export function apply(ctx) {
    * idle or a model stream is in flight. Runs outside the global replay lock, so a
    * slow compaction never delays other sessions' keep-alive.
    */
-  function startCompaction(sessionId, entry) {
+  async function startCompaction(sessionId, entry) {
     const agent = optionalService('agents')?.get?.(sessionId);
     if (agent === undefined) {
       entry.stopped = true;
@@ -771,6 +811,11 @@ export function apply(ctx) {
       return true;
     }
     if (agent.status !== 'idle' || inflight.has(sessionId) || compacting.has(sessionId)) return false;
+    const realAt = entry.lastRealAt;
+    if (cfg.compactSkipWhenBusy && (await hasRunningWork(sessionId, entry))) return false;
+    // The check above yielded: a real request or a new turn may have arrived meanwhile.
+    if (entry.lastRealAt !== realAt || agent.status !== 'idle' || inflight.has(sessionId) || compacting.has(sessionId) || entry.stopped) return false;
+    entry.compactBlocked = undefined;
     compacting.add(sessionId);
     entry.stopped = true;
     const idleMinutes = +((Date.now() - entry.lastRealAt) / 60000).toFixed(1);
@@ -821,7 +866,7 @@ export function apply(ctx) {
         return;
       }
     }
-    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && startCompaction(sessionId, entry)) return;
+    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && (await startCompaction(sessionId, entry))) return;
     const now = Date.now();
     // With compaction on, the idle cap must leave room for the compaction to happen first.
     const idleCapMinutes = compactOn ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
@@ -996,11 +1041,12 @@ export function apply(ctx) {
     else if (compacting.has(sessionId)) status = 'running';
     else if (last !== null && entry.stopped && entry.lastRealAt <= last.at) status = last.kind === 'manual' ? 'manual' : 'done';
     else if (entry.stopped) status = 'stopped';
+    else if (entry.compactBlocked !== undefined && Date.now() - entry.lastRealAt >= minutes * 60_000) status = 'blocked';
     else {
       status = 'counting';
       dueSeconds = Math.max(0, Math.round((entry.lastRealAt + minutes * 60_000 - Date.now()) / 1000));
     }
-    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, lastCompaction: last };
+    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, lastCompaction: last };
   }
 
   /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
@@ -1030,6 +1076,7 @@ export function apply(ctx) {
         compactAfterMinutes: cfg.compactAfterMinutes,
         compactEnabled: cfg.compactEnabled,
         compactResetOnManual: cfg.compactResetOnManual,
+        compactSkipWhenBusy: cfg.compactSkipWhenBusy,
         sessionCompact: cfg.sessionCompact,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,

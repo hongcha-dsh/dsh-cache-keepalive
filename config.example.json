@@ -24,5 +24,7 @@
   "prices": {},
   "requireProvenCache": true,
   "compactEnabled": false,
+  "compactResetOnManual": true,
+  "compactSkipWhenBusy": true,
   "sessionCompact": {}
 }

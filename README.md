@@ -96,6 +96,7 @@ saves nothing and only burns quota - leave those routes out of `config.routes`.
 | replay output cap | 16 (2-64) | `maxTokens` of the replay. At least 2: some relays short-circuit `max_tokens: 1` without touching the cache |
 | compaction default / minutes | off / 20 (5-120) | a window with compaction on, idle that long, is compacted once and keep-alive stops for it |
 | clear countdown on manual compaction | on | when the user runs `/compact` in a window the plugin tracks, that window's auto-compaction countdown is cleared: the now-obsolete request snapshot is dropped and keep-alive/compaction wait for the next real request, which starts a fresh countdown. Off = manual compaction is ignored |
+| skip compaction while work is running | on | a background job or subagent of that window still running postpones its auto-compaction (re-checked every scan) until it finishes. Off = only the agent's own idle state is checked |
 
 `maxTouches` (the old setting) is gone; a leftover `maxTouches` in `config.json` is ignored and noted
 in the log (`config-notice`).
@@ -143,7 +144,12 @@ saving. All figures are estimates, not a bill.
 - **Compaction** (opt-in per window, needs keep-alive on): when the window has been idle `compactAfterMinutes`
   and its agent is idle and has no stream in flight, the official compaction runs once (scoped
   `compaction.compactNow`, falling back to the `/compact` command) outside the replay lock, with a 10 min
-  watchdog, and keep-alive stops for that window. The window is marked stopped *before* the call, so a
+  watchdog, and keep-alive stops for that window. If the window still owns a **running background job or subagent** (the agent itself is idle then, waiting for the
+  completion notice), the compaction is postponed instead (setting above; one `compact` log line with
+  `status: "postponed"` per idle gap, and the compaction card shows "任务中"); it runs on the first scan after the work
+  has finished. Only `job` and `subagent` entries count (a pending `schedule` entry, e.g. a reminder due next week, does not). The check asks DSH's `workspace/session-activity` question (the one it asks before archiving a session);
+  a host without it is treated as "nothing running", and a failing check postpones the round. A turn that is merely
+  waiting on a tool call or subagent has agent status `running`, which was already never compacted. The window is marked stopped *before* the call, so a
   failure or no-op never retriggers. If the agent is busy, compaction is skipped and keep-alive carries on.
   Do not install `dsh-auto-compact` together with this: it compacts after 3 idle minutes and defeats the
   keep-alive. The channel order is taken from [`fpm0312/dsh-auto-compact`](https://github.com/fpm0312/dsh-auto-compact).
@@ -161,7 +167,7 @@ prompt text.
 | method + path | purpose |
 |---|---|
 | `GET /plugins/cache-keepalive/state` | config (with the derived `maxTouches`), counters, tracked sessions, per-task records, and `windows` (numbers since that window was switched on, with the interval/limit of its route) |
-| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped |
+| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactSkipWhenBusy`, `compactResetOnManual`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped |
 | `POST /plugins/cache-keepalive/session` | `{"session":"<id>","enabled"?:bool,"compact"?:bool}`: one window's switches |
 | `GET /plugins/cache-keepalive/task?session=<id>` | one task record plus its per-touch detail |
 | `POST /plugins/cache-keepalive/task/delete` | `{"session":"<id>"}`: forget that task record |
@@ -172,7 +178,7 @@ prompt text.
 | file | purpose |
 |---|---|
 | `config.json` | live config (not committed), including the per-window `sessionEnabled` / `sessionCompact` maps; hot-reloaded every 2 s (a file that is not valid JSON is ignored and the previous settings are kept); written atomically. `scanSeconds` takes effect after a reload |
-| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `defer`, `compact`, `config`, `session-switch`, `compact-switch`, `record-deleted` |
+| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `defer`, `compact` (incl. `postponed`), `config`, `session-switch`, `compact-switch`, `record-deleted` |
 
 ## Limits
 
