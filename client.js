@@ -354,9 +354,12 @@ window.__ModuleLoader__.load({
         const validNow = (key) => (parsed[key] ? (parsed[key].ok ? parsed[key].value : null) : base[key]);
         const iv = validNow('intervalMinutes');
         const mx = validNow('maxIdleMinutes');
-        const derived = typeof iv === 'number' && typeof mx === 'number' && iv > 0 ? Math.floor(mx / iv) : config.maxTouches;
-        const derivedText = typeof derived !== 'number' ? '—' : derived < 1 ? '不足 1 次，请缩短间隔或延长时长' : '约 ' + tokens(derived) + ' 次保活（按上方间隔自动计算；个别线路的间隔不同）';
         const compactMinutes = validNow('compactAfterMinutes') || 20;
+        // With compaction on, a window keeps going up to max(max duration, compact minutes + 1): same rule as the Host's routeLimits.
+        const compactDefaultOn = boolValue('compactEnabled') === true;
+        const capMinutes = typeof mx === 'number' && compactDefaultOn ? Math.max(mx, compactMinutes + 1) : mx;
+        const derived = typeof iv === 'number' && typeof capMinutes === 'number' && iv > 0 ? Math.floor(capMinutes / iv) : config.maxTouches;
+        const derivedText = typeof derived !== 'number' ? '—' : derived < 1 ? '不足 1 次，请缩短间隔或延长时长' : '约 ' + tokens(derived) + ' 次保活（按上方间隔自动计算；个别线路的间隔不同' + (compactDefaultOn ? '；已按开启压缩的窗口计，其上限是压缩时间 + 1 分钟' : '') + '）';
 
         const numberInput = (key, unit, title) => h(React.Fragment, null,
           h('input', {
@@ -646,7 +649,7 @@ window.__ModuleLoader__.load({
             );
           }),
           h('p', { className: 'ka-foot', style: { padding: '10px 14px', borderTop: '1px solid var(--ka-b1)' } },
-            '净省 = 缓存过期后下一次请求要整段重写缓存的额外花费（写入价 − 读取价）− 该空闲期所有保活花费。只统计之后用户确实回来发了请求的空闲期；金额均为按价格表的估算，不是账单。')
+            '净省 = 缓存过期后下一次请求要整段重写缓存的额外花费（写入价 − 读取价）− 该空闲期所有保活花费。只统计之后用户确实回来发了请求的空闲期；还在空闲中的一段只扣已花的保活费，不计省下的钱；金额均为按价格表的估算，不是账单。')
         );
       }
 

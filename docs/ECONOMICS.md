@@ -36,15 +36,17 @@ This is why `maxIdleMinutes` defaults to **45**: with a 4-minute interval that i
 
 "Net" = avoided rewrite − replay spend. Past the break-even the plugin stops by itself (`maxIdleMinutes`), so the negative rows are exactly what the cap prevents.
 
-## Measured run (this plugin, real conversations, 2026-11-18)
+## Measured run (this plugin, real conversations, 2026-11-18 to 2026-11-19)
 
-From `keepalive.jsonl`: 11 replays, **11 / 11 cache hits (100 %)**, mean 256k tokens read per replay, 24 uncached input tokens and 166 output tokens in total, 4–16 s per replay.
-Over the 5 idle gaps that ended with a real request:
+From `keepalive.jsonl`: 49 replays, **49 / 49 cache hits (100 %)**, mean 325k tokens read per replay, 104 uncached input tokens and 784 output tokens in total, 3–16 s per replay.
+Over the 15 idle gaps that ended with a real request (the newest gap of each session is still open and not counted; a gap whose user never came back cannot be told apart in the log, so the avoided figure is an upper bound):
 
 | | replay spend | avoided rewrite | net | return on spend |
 |---|---|---|---|---|
-| A (relay list) | ¥0.415 | ¥2.81 | **¥2.40** | **6.8×** |
-| B (Anthropic list) | ¥1.43 | ¥20.11 | **¥18.68** | **14.1×** |
+| A (relay list) | ¥3.10 | ¥10.39 | **¥7.28** | **3.3×** |
+| B (Anthropic list) | ¥10.66 | ¥74.31 | **¥63.65** | **7.0×** |
+
+Avoided rewrite is `max cacheRead in the gap × (write − hit)`. One gap ran all 15 replays on a 520k conversation (≈ ¥1.52 spent against ¥1.17 avoided under A, a small loss), which is what the 45-minute cap exists to limit.
 
 ## Worst-case spend bound
 

@@ -454,7 +454,7 @@ export function apply(ctx) {
    * in gap.cost. net = C * (cold - hit) - gap.cost. A gap whose only outcomes were
    * misses/errors saved nothing and cost cash.
    */
-  function summarizeSession(records) {
+  function summarizeSession(records, lastGapOpen = false) {
     const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
     const gaps = [];
     let previousTouch = 0;
@@ -484,7 +484,12 @@ export function apply(ctx) {
         gap.hit = true;
       }
     }
-    for (const gap of gaps) {
+    for (const [gapIndex, gap] of gaps.entries()) {
+      // A gap that has not ended in a real request yet saved nothing so far: it only counts what it cost.
+      if (lastGapOpen && gapIndex === gaps.length - 1) {
+        summary.saved -= gap.cost;
+        continue;
+      }
       const price = priceFor(gap.provider, gap.model);
       // What the NEXT real request would have cost, per 1M tokens, had the cache expired, minus what it costs on a live cache.
       const coldPerM = price.miss === 'input+write' ? price.input + price.write : price.write;
@@ -496,6 +501,14 @@ export function apply(ctx) {
     summary.cost = +summary.cost.toFixed(6);
     summary.saved = +summary.saved.toFixed(6);
     return summary;
+  }
+
+  /** True while the session's newest idle gap has no real request after it (the user has not come back yet). */
+  function lastGapOpenOf(sessionId, records) {
+    const entry = sessions.get(sessionId);
+    const last = records[records.length - 1];
+    if (entry === undefined || last === undefined) return false;
+    return entry.lastRealAt < Date.parse(last.ts);
   }
 
   /**
@@ -552,7 +565,7 @@ export function apply(ctx) {
         enabled,
         compact: compactEnabledOf(sessionId),
         since: since === null ? null : since,
-        ...summarizeSession(kept),
+        ...summarizeSession(kept, lastGapOpenOf(sessionId, kept)),
         lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
         gapTouches: entry === undefined ? 0 : entry.touches,
         ...routeLimits(sessionId, entry),
@@ -592,7 +605,7 @@ export function apply(ctx) {
         model: latest?.model ?? null,
         firstAt: records[0]?.ts ?? null,
         lastAt: latest?.ts ?? null,
-        ...summarizeSession(records)
+        ...summarizeSession(records, lastGapOpenOf(sessionId, records))
       });
     }
     tasks.sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
@@ -616,7 +629,7 @@ export function apply(ctx) {
       }));
   }
 
-  /** Forget one task: drop its keepalive lines from disk and stop its current idle gap. */
+  /** Forget one task: drop its keepalive lines from disk (switch/capture lines stay, they carry the "本次开启" start) and stop its current idle gap. */
   function deleteTask(sessionId) {
     try {
       let kept = [];
@@ -626,7 +639,7 @@ export function apply(ctx) {
           if (line.trim().length === 0) return false;
           try {
             const record = JSON.parse(line);
-            return !(record !== null && typeof record === 'object' && record.session === sessionId);
+            return !(record !== null && typeof record === 'object' && record.session === sessionId && record.kind === 'keepalive');
           } catch {
             return true;
           }
@@ -1411,12 +1424,17 @@ export function apply(ctx) {
       /* no config yet, or unreadable: nothing to report */
     }
     appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
-    const timer = setInterval(() => {
-      tick().catch((error) => {
-        ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
-      });
-    }, cfg.scanSeconds * 1000);
-    timer.unref?.();
+    let timerSeconds = cfg.scanSeconds;
+    const startTimer = () => {
+      const t = setInterval(() => {
+        tick().catch((error) => {
+          ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
+        });
+      }, timerSeconds * 1000);
+      t.unref?.();
+      return t;
+    };
+    let timer = startTimer();
 
     let lastMtime = 0;
     try {
@@ -1433,6 +1451,12 @@ export function apply(ctx) {
         }
         const changed = JSON.stringify(next) !== JSON.stringify(cfg);
         cfg = next;
+        // scanSeconds is only read when the timer is created, so a change has to rebuild it.
+        if (cfg.scanSeconds !== timerSeconds) {
+          clearInterval(timer);
+          timerSeconds = cfg.scanSeconds;
+          timer = startTimer();
+        }
         if (changed) {
           appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
         }

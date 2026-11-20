@@ -533,6 +533,8 @@ describe('f 分路由价格与净省', () => {
     await h.real(HIT);
     h.replayUsage = { ...usage };
     await h.advance(4 * MIN);
+    assert.ok((await h.state()).tasks[0].saved < 0, '用户还没回来：只扣花费，不计省下的钱');
+    await h.real(HIT); // 用户回来：这一段结束
     const st = await h.state();
     const t = st.tasks[0];
     close(t.cost, costOf(sonnet));
@@ -563,6 +565,7 @@ describe('f 分路由价格与净省', () => {
     await h.real(HIT, { model: OPUS.model });
     h.replayUsage = { ...usage };
     await h.advance(4 * MIN);
+    await h.real(HIT, { model: OPUS.model });
     const t = (await h.state()).tasks[0];
     close(t.cost, costOf(opus));
     close(t.saved, savedOf(opus));
@@ -577,6 +580,7 @@ describe('f 分路由价格与净省', () => {
     await h.real(HIT);
     h.replayUsage = { ...usage };
     await h.advance(4 * MIN);
+    await h.real(HIT);
     const t = (await h.state()).tasks[0];
     close(t.cost, 0.100148);
     close(t.saved, 0.199852, 1e-6); // no miss tag: coldPerM = write = 4, avoided = 4 - 1
@@ -919,6 +923,19 @@ describe('j 端点防 CSRF、白名单、上限', () => {
     r = await h.http('/plugins/cache-keepalive/task/delete', { method: 'POST', body: { session: SID }, headers: { 'content-type': undefined } });
     assert.equal(r.status, 415);
     assert.equal((await h.state()).config.sessionEnabled[SID], undefined, '被拒绝的请求不得生效');
+  });
+
+  test('j1b 删除任务记录只删 keepalive 行，保留 session-switch（“本次开启”起点）', async () => {
+    h = await setup({ config: { sessionEnabled: {} } });
+    await h.http(SWITCH, { method: 'POST', body: { session: SID, enabled: true } });
+    await h.real(HIT);
+    h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
+    await h.advance(4 * MIN);
+    assert.equal(h.logLines().filter((l) => l.kind === 'keepalive' && l.session === SID).length, 1);
+    const r = await h.http('/plugins/cache-keepalive/task/delete', { method: 'POST', body: { session: SID } });
+    assert.equal(r.status, 200);
+    assert.equal(h.logLines().filter((l) => l.kind === 'keepalive' && l.session === SID).length, 0);
+    assert.equal(h.logLines().filter((l) => l.kind === 'session-switch' && l.session === SID).length, 1, 'session-switch 必须保留');
   });
 
   test('j2 Origin 与 Host 不同 → 403；Origin 与 Host 相同 → 200', async () => {
@@ -1360,6 +1377,7 @@ describe('t 净省口径', () => {
     await h.real(HIT, { provider: KIMI.provider, model: KIMI.model });
     h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
     await h.advance(4 * MIN);
+    await h.real(HIT, { provider: KIMI.provider, model: KIMI.model });
     const t = (await h.state()).tasks[0];
     const cost = (100000 * 1.3 + 50 * 13 + 16 * 68) / 1e6; // 0.131738
     close(t.cost, cost, 1e-9);
@@ -1373,6 +1391,7 @@ describe('t 净省口径', () => {
     await h.real(HIT, { provider: HUOSAN.provider, model: HUOSAN.model });
     h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
     await h.advance(4 * MIN);
+    await h.real(HIT, { provider: HUOSAN.provider, model: HUOSAN.model });
     close((await h.state()).tasks[0].saved, 2.338262, 1e-6);
   });
 
@@ -1381,6 +1400,7 @@ describe('t 净省口径', () => {
     await h.real(HIT);
     h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
     await h.advance(4 * MIN);
+    await h.real(HIT);
     const t = (await h.state()).tasks[0];
     close(t.cost, 0.100148, 1e-9);
     close(t.saved, 100000 * (6 - 1) / 1e6 - 0.100148, 1e-6); // 0.5 - 0.100148 = 0.399852
@@ -1392,31 +1412,36 @@ describe('t 净省口径', () => {
     await h.real(HIT);
     h.replayUsage = { cacheReadTokens: 100000, inputTokens: 50, outputTokens: 16 };
     await h.advance(4 * MIN);
+    await h.real(HIT);
     close((await h.state()).tasks[0].saved, 0.199852, 1e-6);
     await h.http(CONFIG_EP, { method: 'POST', body: { maxIdleMinutes: 50 } }); // 触发 saveConfig 规范化
     const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
     assert.equal(onDisk.prices[SONNET_KEY]?.miss, undefined, '非法 miss 不写入 prices');
   });
 
-  test('t-c 多次保活的一个空闲段：saved 随次数线性下降，约 11.5 次后为负（Sonnet, C=300000）', async () => {
-    h = await setup({ config: { maxIdleMinutes: 60 } });
-    await h.real(HIT);
-    h.replayUsage = { cacheReadTokens: 300000, inputTokens: 50, outputTokens: 16 };
+  test('t-c 多次保活的一个空闲段：用户回来后 saved = base − k×cost，约 11.5 次后为负（Sonnet, C=300000）', async () => {
     const cost1 = costPer(sonnetP, 300000, 50, 16); // 0.0585727752
     const base = (300000 * (sonnetP.write - sonnetP.hit)) / 1e6; // 0.67086
-    const breakeven = base / cost1;
-    close(breakeven, 11.4527, 1e-3);
-    const seen = [];
-    for (let k = 1; k <= 12; k++) {
-      await h.advance(4 * MIN);
+    close(base / cost1, 11.4527, 1e-3);
+    const settle = async (k) => {
+      h = await setup({ config: { maxIdleMinutes: 60 } });
+      await h.real(HIT);
+      h.replayUsage = { cacheReadTokens: 300000, inputTokens: 50, outputTokens: 16 };
+      for (let n = 1; n <= k; n++) {
+        await h.advance(4 * MIN);
+        const open = (await h.state()).tasks[0];
+        assert.equal(open.touches, n);
+        close(open.saved, -n * cost1, 1e-5); // 还没回来：只扣花费
+      }
+      await h.real(HIT);
       const t = (await h.state()).tasks[0];
       assert.equal(t.touches, k);
       close(t.saved, base - k * cost1, 1e-5);
-      seen.push(t.saved);
-    }
-    for (let i = 1; i < seen.length; i++) assert.ok(seen[i] < seen[i - 1], '随次数单调下降');
-    assert.ok(seen[10] > 0, '第 11 次仍为正');
-    assert.ok(seen[11] < 0, '第 12 次起为负');
+      return t.saved;
+    };
+    assert.ok(await settle(11) > 0, '第 11 次仍为正');
+    h.teardown();
+    assert.ok(await settle(12) < 0, '第 12 次起为负');
   });
 
   test('t-d 两个空闲段（中间新的真实请求）分别结算再相加', async () => {
@@ -1427,6 +1452,7 @@ describe('t 净省口径', () => {
     await h.real(HIT); // 新的真实请求：新段开始（touch 归零）
     h.replayUsage = { cacheReadTokens: 300000, inputTokens: 50, outputTokens: 16 };
     await h.advance(4 * MIN + 30_000); // 1 次保活（gap 2）
+    await h.real(HIT); // 用户回来，gap 2 结束
     const t = (await h.state()).tasks[0];
     assert.equal(t.touches, 3);
     const c1 = costPer(sonnetP, 100000, 50, 16);

@@ -48,9 +48,10 @@ One 300k-token conversation, user comes back after:
 
 The negative rows are what the duration cap prevents: past break-even the plugin stops by itself.
 
-Measured with this plugin on real conversations (2026-11-18): 11 / 11 replays hit the cache, ¥0.415
-spent against ¥2.81 of avoided rewrites under A (**6.8× return**), ¥1.43 against ¥20.11 under B
-(**14.1×**). Worst case: 3 conversations × 11 replays, none of which ever comes back, is about ¥1.9 under
+Measured with this plugin on real conversations (2026-11-18 to 2026-11-19): 49 / 49 replays hit the
+cache, over 15 idle gaps that ended in a real request. ¥3.10 spent against ¥10.39 of avoided rewrites
+under A (**3.3× return**), ¥10.66 against ¥74.31 under B (**7.0×**). One of the gaps ran the full
+15 replays on a 520k conversation and lost money under A, which is what the duration cap is for. Worst case: 3 conversations × 11 replays, none of which ever comes back, is about ¥1.9 under
 A; the hit-ratio check and the stale guard (below) can stop it sooner.
 
 All figures are estimates from list prices, not a bill.
@@ -105,7 +106,7 @@ in the log (`config-notice`).
 
 Had the cache expired, the next real request would have paid a cache write for the whole prefix
 instead of a cache read, so the avoided cost of an idle gap that ended in a real request is
-`C × (cold − hit)`, where `cold` is the cache-write price (kimi bills an expired prefix at input +
+`C × (cold − hit)` (a gap that is still idle has not ended yet: it only subtracts what it has cost so far), where `cold` is the cache-write price (kimi bills an expired prefix at input +
 write, so its entries carry `miss: "input+write"`). The estimate subtracts what the replays cost:
 
 ```
@@ -191,7 +192,7 @@ prompt text.
 - Per window, off by default. Turning a window on while it is idle arms it on the next real request.
 - Task names come from the session title; a session without a generated title yet falls back to `会话 <short id>`.
 - Deleting a record removes its `keepalive` lines from `keepalive.jsonl` and stops the current idle gap for that
-  session; it does not toggle the keep-alive.
+  session (the `session-switch` lines stay: they hold the "本次开启" start); it does not toggle the keep-alive.
 - No UI for adding routes or prices yet; edit `config.json` (`routes`, `routeIntervals`, `prices`).
 - The settings page texts are Chinese only.
 
