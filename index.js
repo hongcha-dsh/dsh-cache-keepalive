@@ -44,6 +44,8 @@ const DEFAULTS = {
   compactResetOnManual: true,
   /** Do not auto-compact a window while a background job or a subagent it started is still running (the agent itself is idle, so its status alone does not show it). */
   compactSkipWhenBusy: true,
+  /** Do not auto-compact a window whose context is below this many tokens (compacting a small context costs more than it saves; see docs/ECONOMICS.md). 0 = no minimum. */
+  compactMinTokens: 150000,
   /** sessionId -> boolean: the per-window compaction switch (needs that window's keep-alive on). */
   sessionCompact: {},
   /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
@@ -98,6 +100,8 @@ function normalizeConfig(raw) {
   cfg.compactEnabled = cfg.compactEnabled === true;
   cfg.compactResetOnManual = cfg.compactResetOnManual !== false;
   cfg.compactSkipWhenBusy = cfg.compactSkipWhenBusy !== false;
+  const minTokens = Number(cfg.compactMinTokens);
+  cfg.compactMinTokens = cfg.compactMinTokens === undefined || cfg.compactMinTokens === null || !Number.isFinite(minTokens) || minTokens < 0 ? DEFAULTS.compactMinTokens : Math.min(Math.floor(minTokens), 5_000_000);
   const perSessionCompact = {};
   if (cfg.sessionCompact && typeof cfg.sessionCompact === 'object' && !Array.isArray(cfg.sessionCompact)) {
     for (const [sessionId, value] of Object.entries(cfg.sessionCompact)) {
@@ -157,7 +161,7 @@ const BLOCKING_KINDS = new Set(['job', 'subagent']);
 const HIT_RATIO = 0.9;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
-const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactSkipWhenBusy', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactSkipWhenBusy', 'compactMinTokens', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
 
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions'];
@@ -723,6 +727,9 @@ export function apply(ctx) {
                 const cacheRead = chunk.usage.cacheReadTokens ?? chunk.usage.cacheRead ?? 0;
                 const uncached = chunk.usage.inputTokens ?? chunk.usage.input ?? 0;
                 route.lastCacheRead = cacheRead;
+                const entry = sessions.get(sessionId);
+                const cacheWriteNow = chunk.usage.cacheWriteTokens ?? chunk.usage.cacheWrite ?? 0;
+                if (entry !== undefined && cacheRead + uncached + cacheWriteNow > 0) entry.contextTokens = cacheRead + uncached + cacheWriteNow;
                 const total = cacheRead + uncached;
                 if (cacheRead >= 1024 && total > 0 && cacheRead / total >= 0.2) route.proven = true;
               }
@@ -816,6 +823,11 @@ export function apply(ctx) {
    * idle or a model stream is in flight. Runs outside the global replay lock, so a
    * slow compaction never delays other sessions' keep-alive.
    */
+  /** A context below compactMinTokens is not worth compacting (unknown size = allowed, as before). */
+  function compactWorthy(entry) {
+    return cfg.compactMinTokens <= 0 || typeof entry?.contextTokens !== 'number' || entry.contextTokens >= cfg.compactMinTokens;
+  }
+
   async function startCompaction(sessionId, entry) {
     const agent = optionalService('agents')?.get?.(sessionId);
     if (agent === undefined) {
@@ -866,7 +878,7 @@ export function apply(ctx) {
       return;
     }
     if (entry.stopped) return;
-    const compactOn = compactEnabledOf(sessionId);
+    const compactOn = compactEnabledOf(sessionId) && compactWorthy(entry);
     // The cache is refreshed from the START of the last request. If we are already well past the replay
     // interval (machine slept, clock jumped, queue backed up) it has probably expired, and a replay or a
     // compaction (which reads the whole context) would only pay for a cold rewrite. Stop instead.
@@ -972,6 +984,7 @@ export function apply(ctx) {
     // A real request arrived while this replay was in flight: it re-armed the entry, so this
     // (now stale) result is recorded but must not stop the new idle gap.
     if ((entry.gen ?? 0) !== gen) return;
+    if (!failed && promptTokens > 0) entry.contextTokens = promptTokens;
     if (failed) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'replay-error' });
@@ -1054,19 +1067,20 @@ export function apply(ctx) {
     else if (compacting.has(sessionId)) status = 'running';
     else if (last !== null && entry.stopped && entry.lastRealAt <= last.at) status = last.kind === 'manual' ? 'manual' : 'done';
     else if (entry.stopped) status = 'stopped';
+    else if (!compactWorthy(entry)) status = 'small';
     else if (entry.compactBlocked !== undefined && Date.now() - entry.lastRealAt >= minutes * 60_000) status = 'blocked';
     else {
       status = 'counting';
       dueSeconds = Math.max(0, Math.round((entry.lastRealAt + minutes * 60_000 - Date.now()) / 1000));
     }
-    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, lastCompaction: last };
+    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, compactMinTokens: cfg.compactMinTokens, contextTokens: typeof entry?.contextTokens === 'number' ? entry.contextTokens : null, lastCompaction: last };
   }
 
   /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
   function routeLimits(sessionId, entry) {
     const snapshot = entry?.snapshot;
     const intervalMs = snapshot === undefined ? cfg.intervalMinutes * 60_000 : intervalFor(snapshot.provider, snapshot.model);
-    const idleCap = compactEnabledOf(sessionId) ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
+    const idleCap = compactEnabledOf(sessionId) && compactWorthy(entry) ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
     return { intervalMinutes: +(intervalMs / 60000).toFixed(1), maxTouches: Math.floor((idleCap * 60_000) / intervalMs) };
   }
 
@@ -1090,6 +1104,7 @@ export function apply(ctx) {
         compactEnabled: cfg.compactEnabled,
         compactResetOnManual: cfg.compactResetOnManual,
         compactSkipWhenBusy: cfg.compactSkipWhenBusy,
+        compactMinTokens: cfg.compactMinTokens,
         sessionCompact: cfg.sessionCompact,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,

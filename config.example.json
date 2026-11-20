@@ -26,5 +26,6 @@
   "compactEnabled": false,
   "compactResetOnManual": true,
   "compactSkipWhenBusy": true,
+  "compactMinTokens": 150000,
   "sessionCompact": {}
 }

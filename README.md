@@ -156,6 +156,10 @@ saving. All figures are estimates, not a bill.
   a host without it is treated as "nothing running", and a failing check postpones the round. A turn that is merely
   waiting on a tool call or subagent has agent status `running`, which was already never compacted. The window is marked stopped *before* the call, so a
   failure or no-op never retriggers. If the agent is busy, compaction is skipped and keep-alive carries on.
+  A window whose context is **below `compactMinTokens`** (default 150000, 0 = no minimum; the size is the prompt of
+  the last real request or replay) is not compacted at all, and its keep-alive cap stays `maxIdleMinutes`: compacting
+  a small context costs more than rewriting the cache (the compaction call, the extra keep-alive up to the compaction
+  time, and the rewrite of the shrunken prefix; see `docs/ECONOMICS.md`). The card shows "不压缩".
   Do not install `dsh-auto-compact` together with this: it compacts after 3 idle minutes and defeats the
   keep-alive. The channel order is taken from [`fpm0312/dsh-auto-compact`](https://github.com/fpm0312/dsh-auto-compact).
 - While an agent turn waits on a long tool call or sub-agent, there is no model stream in flight, so the
@@ -172,7 +176,7 @@ prompt text.
 | method + path | purpose |
 |---|---|
 | `GET /plugins/cache-keepalive/state` | config (with the derived `maxTouches`), counters, tracked sessions, per-task records, and `windows` (numbers since that window was switched on, with the interval/limit of its route) |
-| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactSkipWhenBusy`, `compactResetOnManual`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped |
+| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactSkipWhenBusy`, `compactMinTokens`, `compactResetOnManual`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped |
 | `POST /plugins/cache-keepalive/session` | `{"session":"<id>","enabled"?:bool,"compact"?:bool}`: one window's switches |
 | `GET /plugins/cache-keepalive/task?session=<id>` | one task record plus its per-touch detail |
 | `POST /plugins/cache-keepalive/task/delete` | `{"session":"<id>"}`: forget that task record |

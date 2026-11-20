@@ -211,7 +211,8 @@ window.__ModuleLoader__.load({
         intervalMinutes: { min: 1, max: 60 },
         maxIdleMinutes: { min: 1, max: 1440 },
         replayMaxTokens: { min: 2, max: 64 },
-        compactAfterMinutes: { min: 5, max: 120 }
+        compactAfterMinutes: { min: 5, max: 120 },
+        compactMinTokens: { min: 0, max: 5000000 }
       };
       // Raw text -> { ok, value } | { ok:false, error }. Empty / non-integer / out of range never reaches the Host.
       function parseField(key, raw) {
@@ -292,7 +293,8 @@ window.__ModuleLoader__.load({
           intervalMinutes: config.intervalMinutes,
           maxIdleMinutes: config.maxIdleMinutes,
           replayMaxTokens: config.replayMaxTokens,
-          compactAfterMinutes: config.compactAfterMinutes
+          compactAfterMinutes: config.compactAfterMinutes,
+          compactMinTokens: config.compactMinTokens
         };
         const loaded = state !== null;
         const bools = { enabled: true, compactEnabled: true, compactResetOnManual: true, compactSkipWhenBusy: true };
@@ -452,6 +454,11 @@ window.__ModuleLoader__.load({
                 error: errors.compactAfterMinutes
               }, numberInput('compactAfterMinutes', '分钟', '空闲多久后压缩')),
               h(SettingRow, {
+                title: '上下文小于多少不压缩',
+                desc: '上下文（token）小于这个数时不自动压缩：小对话压不下去，压缩调用和压缩后重新写缓存的花费反而比直接重写缓存更高。这样的窗口保活到最长保活时长就停。填 0 表示不设下限。范围 0–5000000。',
+                error: errors.compactMinTokens
+              }, numberInput('compactMinTokens', 'token', '上下文小于多少不压缩')),
+              h(SettingRow, {
                 title: '手动压缩时清零倒计时',
                 desc: '你在窗口里手动执行 /compact 后，该窗口的自动压缩倒计时清零：已过时的保活请求快照会被丢弃，保活与压缩都等下一条真实消息后重新开始。关闭则不处理手动压缩。'
               }, h(Switch, { checked: boolValue('compactResetOnManual') === true, onChange: (v) => edit('compactResetOnManual', v), disabled: !loaded, label: '手动压缩时清零倒计时' })),
@@ -498,6 +505,7 @@ window.__ModuleLoader__.load({
           return h('span', { className: 'ka-chip warn ka-num', title: '距自动压缩' }, due === null ? '压缩' : due <= 0 ? '即将压缩' : '压缩 ' + countdown(due));
         }
         if (status === 'running') return h('span', { className: 'ka-chip warn' }, '压缩中');
+        if (status === 'small') return h('span', { className: 'ka-chip', title: '上下文不到 ' + Math.round((win.compactMinTokens || 0) / 1000) + 'k token，压缩不划算，不会自动压缩' }, '不压缩');
         if (status === 'blocked') return h('span', { className: 'ka-chip warn', title: '有后台任务或子 agent 在运行，暂缓压缩' }, '任务中');
         if (status === 'done' || status === 'manual') return h('span', { className: 'ka-chip ok', title: status === 'manual' ? '已手动压缩，等下一条消息重新计时' : '已自动压缩，等下一条消息重新计时' }, '已压缩');
         if (status === 'waiting') return h('span', { className: 'ka-chip', title: '等待下一条消息开始计时' }, '待命');
@@ -835,6 +843,10 @@ window.__ModuleLoader__.load({
               due !== null && due > 0 ? h('span', { style: { color: TIP.tertiary } }, '后压缩') : null),
             note('空闲满 ' + minutesText + ' 分钟后压缩一次，之后停止保活'));
         } else if (status === 'running') body = note('正在压缩…');
+        else if (status === 'small') {
+          const kTok = (n) => (typeof n === 'number' ? Math.round(n / 1000) + 'k' : '?');
+          body = note('当前上下文约 ' + kTok(win && win.contextTokens) + ' token，低于下限 ' + kTok(win && win.compactMinTokens) + '：压缩一次的花费比直接重写缓存还高，所以不自动压缩。保活照常，到最长保活时长就停。');
+        }
         else if (status === 'blocked') {
           const kinds = win && Array.isArray(win.compactBlockedBy) ? win.compactBlockedBy : [];
           const names = kinds.map((k) => (k === 'job' ? '后台任务' : k === 'subagent' ? '子 agent' : '任务')).filter((v, i, a) => a.indexOf(v) === i).join('、');

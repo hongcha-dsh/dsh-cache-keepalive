@@ -56,7 +56,7 @@ async function setup({ config = {}, agents = {}, compaction, realTimers = false,
   fs.copyFileSync(SRC, modPath);
   fs.writeFileSync(
     path.join(dir, 'config.json'),
-    JSON.stringify({ enabled: false, sessionEnabled: { [SID]: true }, routes: [CLAUDE], routeIntervals: {}, ...config }, null, 2)
+    JSON.stringify({ enabled: false, sessionEnabled: { [SID]: true }, routes: [CLAUDE], routeIntervals: {}, compactMinTokens: 0, ...config }, null, 2)
   );
   const hooks = [];
   const sessionEventHooks = [];
@@ -2027,5 +2027,57 @@ describe('w 运行中的任务不被压缩（compactSkipWhenBusy）', () => {
     const r = await h.http(CONFIG_EP, { method: 'POST', body: { compactSkipWhenBusy: false } });
     assert.equal(r.status, 200);
     assert.equal((await h.state()).config.compactSkipWhenBusy, false);
+  });
+});
+
+// ---------------- x. 小上下文不压缩（compactMinTokens） ----------------
+describe('x 小上下文不压缩（compactMinTokens）', () => {
+  const BIG = { cacheReadTokens: 200000, inputTokens: 100, outputTokens: 10 };
+  const mkComp = () => { const c = { calls: 0, compactNow: async () => { c.calls += 1; return { shadowedTokenCount: 1 }; } }; return c; };
+
+  test('x1 默认下限 150000', async () => {
+    h = await setup({ config: { compactMinTokens: undefined } });
+    assert.equal((await h.state()).config.compactMinTokens, 150000);
+  });
+
+  test('x2 非法值回落默认；0 = 不设下限', async () => {
+    h = await setup({ config: { compactMinTokens: -5 } });
+    assert.equal((await h.state()).config.compactMinTokens, 150000);
+    h.teardown();
+    h = await setup({ config: { compactMinTokens: 0 } });
+    assert.equal((await h.state()).config.compactMinTokens, 0);
+  });
+
+  test('x3 上下文小于下限：不压缩，状态 small，保活到最长保活时长（不延长到压缩时间 + 1）', async () => {
+    const comp = mkComp();
+    h = await setup({ config: { compactMinTokens: 150000, compactEnabled: true, compactAfterMinutes: 10, maxIdleMinutes: 20 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(11 * MIN);
+    assert.equal(comp.calls, 0);
+    const win = (await h.state()).windows[SID];
+    assert.equal(win.compactStatus, 'small');
+    assert.equal(win.compactMinTokens, 150000);
+    assert.equal(win.contextTokens, 5100);
+    await h.advance(30 * MIN);
+    assert.equal(comp.calls, 0);
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
+    assert.ok(h.streamCalls.length <= 5, '最长保活 20 分钟 / 间隔 4 分钟 = 5 次');
+  });
+
+  test('x4 上下文达到下限：照常压缩', async () => {
+    const comp = mkComp();
+    h = await setup({ config: { compactMinTokens: 150000, compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.replayUsage = { ...BIG };
+    await h.real(BIG);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 1);
+  });
+
+  test('x5 下限为 0：小上下文也压缩（旧行为）', async () => {
+    const comp = mkComp();
+    h = await setup({ config: { compactMinTokens: 0, compactEnabled: true, compactAfterMinutes: 10 }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 1);
   });
 });
