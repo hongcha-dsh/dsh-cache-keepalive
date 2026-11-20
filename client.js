@@ -454,8 +454,10 @@ window.__ModuleLoader__.load({
               }, h(Switch, { checked: boolValue('compactResetOnManual') === true, onChange: (v) => edit('compactResetOnManual', v), disabled: !loaded, label: '手动压缩时清零倒计时' })),
               h(SettingRow, {
                 title: '有后台任务时不压缩',
-                desc: '后台任务（job）或子 agent 还在运行时，即使空闲时间已到也暂缓压缩，任务结束后再压缩，避免长任务跑到一半被压缩。关闭则只看窗口自身是否空闲。'
+                desc: '后台任务（job）或子 agent 还在运行时，即使空闲时间已到也暂缓压缩，避免长任务跑到一半被压缩。任务结束会叫醒 agent，倒计时随之从头开始。关闭则只看窗口自身是否空闲。'
               }, h(Switch, { checked: boolValue('compactSkipWhenBusy') === true, onChange: (v) => edit('compactSkipWhenBusy', v), disabled: !loaded, label: '有后台任务时不压缩' })),
+              h('div', { className: 'ka-note' }, h('i', { 'aria-hidden': 'true' }, 'i'),
+                h('span', null, '长任务期间的保活策略：后台任务或子 agent 运行时，保活照常按间隔进行，但不会无限延长，到了最长保活时长（开着压缩时为「最长保活时长」与「压缩时间＋1 分钟」中较大者）就停。任务结束会叫醒 agent，保活和压缩倒计时从头开始，所以长任务结束时不会因为早已过了压缩时间而被压缩。是否划算：保活 k 次的花费约为 k 次缓存读，缓存过期后重写要多付「写价−读价」，所以 k ≤ 写价÷读价 − 1 时保活才比不保活省钱，与上下文大小无关（中转站按写价 1.25 倍估约 11 次，约 46 分钟；官方价约 24 次，约 95 分钟）。建议最长保活时长不要超过这个数；任务比这更久，缓存会过期，结束时重写一次。')),
               h('div', { className: 'ka-note' }, h('i', { 'aria-hidden': 'true' }, 'i'),
                 h('span', null, '压缩开启的窗口，空闲满 ', h('b', { className: 'ka-num' }, String(compactMinutes)), ' 分钟后压缩一次并停止保活，下一次真实请求再重新开始。请勿与 ', h('code', null, 'dsh-auto-compact'), ' 同装，否则它会提前压缩、让保活白费。'))
             )
@@ -833,7 +835,7 @@ window.__ModuleLoader__.load({
         else if (status === 'blocked') {
           const kinds = win && Array.isArray(win.compactBlockedBy) ? win.compactBlockedBy : [];
           const names = kinds.map((k) => (k === 'job' ? '后台任务' : k === 'subagent' ? '子 agent' : '任务')).filter((v, i, a) => a.indexOf(v) === i).join('、');
-          body = note('已到压缩时间，但' + (names || '任务') + '还在运行，暂缓压缩；任务结束后自动压缩。保活继续，直到达到最长保活时长');
+          body = note('已到压缩时间，但' + (names || '任务') + '还在运行，暂缓压缩。保活继续，直到达到最长保活时长；任务结束叫醒 agent 后，倒计时从头开始');
         }
         else if (status === 'done' || status === 'manual') {
           body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },

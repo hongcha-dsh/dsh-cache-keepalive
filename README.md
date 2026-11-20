@@ -31,7 +31,7 @@ The relay's cache-write price is unpublished, so two assumptions are shown (¥ p
 | | hit | write | `k*` | `4·k*` |
 |---|---|---|---|---|
 | A. relay list (Claude-Sonnet-5.5; read 0.1× input, write assumed 1.25× input) | 0.1944 | 2.4306 | 11.5 | ≈ 46 min |
-| B. Anthropic list (read 0.05×, write 1.25× of $2/M, at ¥6.667/$) | 0.667 | 16.67 | 23.9 | ≈ 95 min |
+| B. Anthropic list (read 0.05×, write 1.25× of $2/M, at ¥6.667/$) | 0.667 | 16.67 | 24.0 | ≈ 96 min |
 
 That is why the max keep-alive duration defaults to **45 min**: 11 replays at a 4-minute interval, below
 break-even under both assumptions, so a conversation that goes quiet never costs more than letting its
@@ -146,8 +146,12 @@ saving. All figures are estimates, not a bill.
   `compaction.compactNow`, falling back to the `/compact` command) outside the replay lock, with a 10 min
   watchdog, and keep-alive stops for that window. If the window still owns a **running background job or subagent** (the agent itself is idle then, waiting for the
   completion notice), the compaction is postponed instead (setting above; one `compact` log line with
-  `status: "postponed"` per idle gap, and the compaction card shows "任务中"); it runs on the first scan after the work
-  has finished. Only `job` and `subagent` entries count (a pending `schedule` entry, e.g. a reminder due next week, does not). The check asks DSH's `workspace/session-activity` question (the one it asks before archiving a session);
+  `status: "postponed"` per idle gap, and the compaction card shows "任务中"); keep-alive carries on up to the
+  idle cap, `max(maxIdleMinutes, compactAfterMinutes + 1)`, then stops. When the work ends, its completion notice wakes
+  the agent; that real request re-arms the window and restarts both countdowns, so a long task is never compacted at
+  its end just because the idle time had long passed. (Keep-alive for k touches pays off while
+  `k ≤ write/hit − 1`, independent of context size: ~11 touches ≈ 46 min on the relay, ~24 ≈ 95 min at list price; keep
+  `maxIdleMinutes` below that.) Only `job` and `subagent` entries count (a pending `schedule` entry, e.g. a reminder due next week, does not). The check asks DSH's `workspace/session-activity` question (the one it asks before archiving a session);
   a host without it is treated as "nothing running", and a failing check postpones the round. A turn that is merely
   waiting on a tool call or subagent has agent status `running`, which was already never compacted. The window is marked stopped *before* the call, so a
   failure or no-op never retriggers. If the agent is busy, compaction is skipped and keep-alive carries on.

@@ -18,7 +18,7 @@ Two price assumptions are shown because the relay's cache-write price is not pub
 | | hit | write | out | `k*` | `4·k*` |
 |---|---|---|---|---|---|
 | A. relay list (AI 智算云 Claude-Sonnet-5.5, ¥/M; read = 0.1× input, write assumed 1.25× input) | 0.1944 | 2.4306 | 9.7222 | 11.5 | ≈ 46 min |
-| B. Anthropic list (Sonnet 5.5: read 0.05×, write 1.25× of $2/M, at ¥6.667/$) | 0.667 | 16.67 | 66.7 | 23.9 | ≈ 95 min |
+| B. Anthropic list (Sonnet 5.5: read 0.05×, write 1.25× of $2/M, at ¥6.667/$) | 0.667 | 16.67 | 66.7 | 24.0 | ≈ 96 min |
 
 This is why `maxIdleMinutes` defaults to **45**: with a 4-minute interval that is 11 replays, below break-even under both assumptions, so a session that goes quiet can never cost more than letting its cache expire.
 
