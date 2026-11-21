@@ -57,9 +57,42 @@ const DEFAULTS = {
   routes: [],
   /** Optional per-route interval override, keyed "provider/model". */
   routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20, 'huosan/kimi-k3.1-pro': 4 },
+  /**
+   * Per-model overrides, keyed "provider/model". Every field is optional; a missing one follows the global
+   * setting (interval also follows routeIntervals). enabled: false = never keep this model alive; enabled: true = keep it
+   * alive even if config.routes does not list it; absent = follow config.routes.
+   * Fields: intervalMinutes, maxIdleMinutes, compactAfterMinutes, compactMinTokens, enabled.
+   */
+  routeSettings: {},
   /** Arm a route only after a real request on it reported cacheRead > 0. */
   requireProvenCache: true
 };
+
+/** Per-model override ranges: the same ones the global settings use. */
+const ROUTE_FIELD_RANGES = {
+  intervalMinutes: { min: 1, max: 60, integer: false },
+  maxIdleMinutes: { min: 1, max: 1440, integer: false },
+  compactAfterMinutes: { min: 5, max: 120, integer: false },
+  compactMinTokens: { min: 0, max: 5_000_000, integer: true }
+};
+
+function normalizeRouteSettings(raw) {
+  const out = {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.includes('/') || value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const entry = {};
+    for (const [field, range] of Object.entries(ROUTE_FIELD_RANGES)) {
+      if (value[field] === undefined || value[field] === null || value[field] === '') continue;
+      const number = Number(value[field]);
+      if (!Number.isFinite(number)) continue;
+      entry[field] = Math.min(Math.max(range.integer ? Math.floor(number) : number, range.min), range.max);
+    }
+    if (typeof value.enabled === 'boolean') entry.enabled = value.enabled;
+    if (Object.keys(entry).length > 0) out[key] = entry;
+  }
+  return out;
+}
 
 function normalizeConfig(raw) {
   const cfg = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) };
@@ -74,6 +107,7 @@ function normalizeConfig(raw) {
     }
   }
   cfg.routeIntervals = intervals;
+  cfg.routeSettings = normalizeRouteSettings(cfg.routeSettings);
   const perSession = {};
   if (cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' && !Array.isArray(cfg.sessionEnabled)) {
     for (const [sessionId, value] of Object.entries(cfg.sessionEnabled)) {
@@ -162,6 +196,8 @@ const HIT_RATIO = 0.9;
 
 /** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
 const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactSkipWhenBusy', 'compactMinTokens', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+/** Max number of per-model override entries kept. */
+const ROUTE_SETTINGS_MAX = 50;
 
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions'];
@@ -292,10 +328,26 @@ export function apply(ctx) {
   function routeKeyOf(provider, model) {
     return String(provider) + '/' + String(model);
   }
+  /**
+   * The value of a per-model setting for one route: its own override, else (interval only) the built-in
+   * routeIntervals preset, else the global setting. No route (a window with no snapshot yet) = global.
+   */
+  function routeParam(provider, model, field) {
+    if (provider === undefined || model === undefined) return cfg[field];
+    const key = routeKeyOf(provider, model);
+    const own = cfg.routeSettings?.[key]?.[field];
+    if (typeof own === 'number') return own;
+    if (field === 'intervalMinutes') {
+      const preset = Number(cfg.routeIntervals?.[key]);
+      if (Number.isFinite(preset) && preset > 0) return preset;
+    }
+    return cfg[field];
+  }
+  function entryParam(entry, field) {
+    return routeParam(entry?.snapshot?.provider, entry?.snapshot?.model, field);
+  }
   function intervalFor(provider, model) {
-    const overrides = cfg.routeIntervals && typeof cfg.routeIntervals === 'object' ? cfg.routeIntervals : {};
-    const minutes = Number(overrides[routeKeyOf(provider, model)]);
-    return (Number.isFinite(minutes) && minutes > 0 ? minutes : cfg.intervalMinutes) * 60_000;
+    return routeParam(provider, model, 'intervalMinutes') * 60_000;
   }
   /** "provider/model" -> { provider, model, proven, lastCacheRead, samples } */
   const routeStats = new Map();
@@ -392,10 +444,16 @@ export function apply(ctx) {
     }
   }
 
-  function routeAllowed(provider, model) {
+  /** Is this model in config.routes (an empty list lists every model)? */
+  function routeListed(provider, model) {
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (routes.length === 0) return true;
     return routes.some((route) => route.provider === provider && route.model === model);
+  }
+  /** The per-model switch wins over config.routes in both directions. */
+  function routeAllowed(provider, model) {
+    const choice = cfg.routeSettings?.[routeKeyOf(provider, model)]?.enabled;
+    return typeof choice === 'boolean' ? choice : routeListed(provider, model);
   }
 
   /** Per-window switch: explicit session choice wins over the config default. */
@@ -825,7 +883,8 @@ export function apply(ctx) {
    */
   /** A context below compactMinTokens is not worth compacting (unknown size = allowed, as before). */
   function compactWorthy(entry) {
-    return cfg.compactMinTokens <= 0 || typeof entry?.contextTokens !== 'number' || entry.contextTokens >= cfg.compactMinTokens;
+    const minTokens = entryParam(entry, 'compactMinTokens');
+    return minTokens <= 0 || typeof entry?.contextTokens !== 'number' || entry.contextTokens >= minTokens;
   }
 
   async function startCompaction(sessionId, entry) {
@@ -878,7 +937,15 @@ export function apply(ctx) {
       return;
     }
     if (entry.stopped) return;
+    if (entry.snapshot !== undefined && !routeAllowed(entry.snapshot.provider, entry.snapshot.model)) {
+      // This model was switched off in the settings while the window was armed.
+      entry.stopped = true;
+      appendLog({ kind: 'stop', session: sessionId, reason: 'route-off' });
+      return;
+    }
     const compactOn = compactEnabledOf(sessionId) && compactWorthy(entry);
+    const compactAfterMinutes = entryParam(entry, 'compactAfterMinutes');
+    const maxIdleMinutes = entryParam(entry, 'maxIdleMinutes');
     // The cache is refreshed from the START of the last request. If we are already well past the replay
     // interval (machine slept, clock jumped, queue backed up) it has probably expired, and a replay or a
     // compaction (which reads the whole context) would only pay for a cold rewrite. Stop instead.
@@ -891,10 +958,10 @@ export function apply(ctx) {
         return;
       }
     }
-    if (compactOn && Date.now() - entry.lastRealAt >= cfg.compactAfterMinutes * 60_000 && (await startCompaction(sessionId, entry))) return;
+    if (compactOn && Date.now() - entry.lastRealAt >= compactAfterMinutes * 60_000 && (await startCompaction(sessionId, entry))) return;
     const now = Date.now();
     // With compaction on, the idle cap must leave room for the compaction to happen first.
-    const idleCapMinutes = compactOn ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
+    const idleCapMinutes = compactOn ? Math.max(maxIdleMinutes, compactAfterMinutes + 1) : maxIdleMinutes;
     if (now - entry.lastRealAt > idleCapMinutes * 60_000) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-idle', idleMinutes: +((now - entry.lastRealAt) / 60000).toFixed(1) });
@@ -1058,7 +1125,7 @@ export function apply(ctx) {
   /** What the compaction half of the composer oval shows: a countdown while armed, otherwise why there is none. */
   function compactionInfo(sessionId, entry) {
     const on = compactEnabledOf(sessionId);
-    const minutes = cfg.compactAfterMinutes;
+    const minutes = entryParam(entry, 'compactAfterMinutes');
     const last = entry?.lastCompaction ?? null;
     let status;
     let dueSeconds = null;
@@ -1073,15 +1140,77 @@ export function apply(ctx) {
       status = 'counting';
       dueSeconds = Math.max(0, Math.round((entry.lastRealAt + minutes * 60_000 - Date.now()) / 1000));
     }
-    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, compactMinTokens: cfg.compactMinTokens, contextTokens: typeof entry?.contextTokens === 'number' ? entry.contextTokens : null, lastCompaction: last };
+    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, compactMinTokens: entryParam(entry, 'compactMinTokens'), contextTokens: typeof entry?.contextTokens === 'number' ? entry.contextTokens : null, lastCompaction: last };
   }
 
   /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
   function routeLimits(sessionId, entry) {
     const snapshot = entry?.snapshot;
     const intervalMs = snapshot === undefined ? cfg.intervalMinutes * 60_000 : intervalFor(snapshot.provider, snapshot.model);
-    const idleCap = compactEnabledOf(sessionId) && compactWorthy(entry) ? Math.max(cfg.maxIdleMinutes, cfg.compactAfterMinutes + 1) : cfg.maxIdleMinutes;
+    const maxIdle = entryParam(entry, 'maxIdleMinutes');
+    const idleCap = compactEnabledOf(sessionId) && compactWorthy(entry) ? Math.max(maxIdle, entryParam(entry, 'compactAfterMinutes') + 1) : maxIdle;
     return { intervalMinutes: +(intervalMs / 60000).toFixed(1), maxTouches: Math.floor((idleCap * 60_000) / intervalMs) };
+  }
+
+  /** "provider/model" -> { provider, model }; the provider id never contains "/", the model id may. */
+  function splitRouteKey(key) {
+    const at = key.indexOf('/');
+    return { provider: key.slice(0, at), model: key.slice(at + 1) };
+  }
+
+  /** Every model the settings page can show: seen at run time, in the log, in a session, or already configured. */
+  function knownRouteKeys() {
+    const keys = new Set();
+    for (const route of routeStats.values()) keys.add(routeKeyOf(route.provider, route.model));
+    for (const record of history) if (record.provider && record.model) keys.add(routeKeyOf(record.provider, record.model));
+    for (const entry of sessions.values()) if (entry.snapshot) keys.add(routeKeyOf(entry.snapshot.provider, entry.snapshot.model));
+    for (const route of cfg.routes) keys.add(routeKeyOf(route.provider, route.model));
+    for (const key of Object.keys(cfg.routeSettings)) keys.add(key);
+    return [...keys];
+  }
+
+  /** One model's settings card: what it overrides, what applies without the override, what applies now, and where keep-alive stops paying. */
+  function routeInfo(provider, model) {
+    const key = routeKeyOf(provider, model);
+    const own = cfg.routeSettings[key] ?? {};
+    const state = routeStats.get(key);
+    const preset = Number(cfg.routeIntervals[key]);
+    const defaults = {
+      intervalMinutes: Number.isFinite(preset) && preset > 0 ? preset : cfg.intervalMinutes,
+      maxIdleMinutes: cfg.maxIdleMinutes,
+      compactAfterMinutes: cfg.compactAfterMinutes,
+      compactMinTokens: cfg.compactMinTokens
+    };
+    const effective = {};
+    for (const field of Object.keys(defaults)) effective[field] = routeParam(provider, model, field);
+    const price = cfg.prices[key] ?? DEFAULT_PRICES[key];
+    let breakEvenTouches = null;
+    if (price !== undefined && price.hit > 0) {
+      const cold = price.miss === 'input+write' ? price.input + price.write : price.write;
+      if (cold > price.hit) breakEvenTouches = Math.floor((cold - price.hit) / price.hit);
+    }
+    const { enabled: _enabled, ...override } = own;
+    return {
+      provider,
+      model,
+      key,
+      /** Keep-alive applies to this model right now. */
+      enabled: routeAllowed(provider, model),
+      /** In config.routes (or the list is empty): what the switch would be without a per-model choice. */
+      listed: routeListed(provider, model),
+      enabledExplicit: typeof own.enabled === 'boolean',
+      override,
+      defaults,
+      effective,
+      intervalMinutes: effective.intervalMinutes,
+      proven: state?.proven === true,
+      lastCacheRead: state?.lastCacheRead ?? 0,
+      samples: state?.samples ?? 0,
+      priced: price !== undefined,
+      breakEvenTouches,
+      breakEvenMinutes: breakEvenTouches === null ? null : Math.round(breakEvenTouches * effective.intervalMinutes),
+      windows: [...sessions.values()].filter((entry) => entry.snapshot && routeKeyOf(entry.snapshot.provider, entry.snapshot.model) === key).length
+    };
   }
 
   function stateSnapshot() {
@@ -1110,16 +1239,13 @@ export function apply(ctx) {
         maxSessions: cfg.maxSessions,
         routes: cfg.routes,
         routeIntervals: cfg.routeIntervals,
+        routeSettings: cfg.routeSettings,
         requireProvenCache: cfg.requireProvenCache
       },
-      routes: [...routeStats.values()].map((route) => ({
-        provider: route.provider,
-        model: route.model,
-        proven: route.proven,
-        lastCacheRead: route.lastCacheRead,
-        samples: route.samples,
-        intervalMinutes: +(intervalFor(route.provider, route.model) / 60000).toFixed(1)
-      })),
+      routes: knownRouteKeys().map((key) => {
+        const { provider, model } = splitRouteKey(key);
+        return routeInfo(provider, model);
+      }),
       sessions: [...sessions.entries()].map(([sessionId, entry]) => ({
         id: sessionId,
         session: String(sessionId).slice(0, 18),
@@ -1254,6 +1380,19 @@ export function apply(ctx) {
             if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config patch must be an object');
             const patch = {};
             for (const key of CONFIG_PATCH_KEYS) if (Object.prototype.hasOwnProperty.call(raw, key)) patch[key] = raw[key];
+            if (raw.routeSettings !== undefined) {
+              // { "provider/model": {fields} | null }: an object replaces that model's overrides, null removes them.
+              if (raw.routeSettings === null || typeof raw.routeSettings !== 'object' || Array.isArray(raw.routeSettings)) throw new Error('routeSettings must be an object');
+              const merged = { ...cfg.routeSettings };
+              for (const [key, value] of Object.entries(raw.routeSettings)) {
+                if (!key.includes('/')) throw new Error('routeSettings keys look like "provider/model"');
+                if (value === null) delete merged[key];
+                else merged[key] = value;
+              }
+              const next = normalizeRouteSettings(merged);
+              if (Object.keys(next).length > ROUTE_SETTINGS_MAX) throw new Error('too many per-model entries (max ' + ROUTE_SETTINGS_MAX + ')');
+              patch.routeSettings = next;
+            }
             cfg = saveConfig({ ...cfg, ...patch });
             appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
             send(res, 200, { ok: true, config: cfg });

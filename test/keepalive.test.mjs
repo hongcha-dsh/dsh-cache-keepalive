@@ -2081,3 +2081,149 @@ describe('x 小上下文不压缩（compactMinTokens）', () => {
     assert.equal(comp.calls, 1);
   });
 });
+
+// ---------------- y. 按模型设置（routeSettings） ----------------
+describe('y 按模型设置（routeSettings）', () => {
+  const KEY = CLAUDE.provider + '/' + CLAUDE.model;
+  const BIG = { cacheReadTokens: 200000, inputTokens: 100, outputTokens: 10 };
+  const mkComp = () => { const c = { calls: 0, compactNow: async () => { c.calls += 1; return { shadowedTokenCount: 1 }; } }; return c; };
+  const post = (routeSettings) => h.http(CONFIG_EP, { method: 'POST', body: { routeSettings } });
+
+  test('y1 归一化：夹取范围、丢弃非法键与空条目、缺省字段不写', async () => {
+    h = await setup({ config: { routeSettings: {
+      [KEY]: { intervalMinutes: 999, maxIdleMinutes: 0.2, compactAfterMinutes: 1, compactMinTokens: 99999999.7, bogus: 1 },
+      'no-slash': { intervalMinutes: 3 },
+      'a/b': {},
+      'c/d': { intervalMinutes: 'x', compactMinTokens: '' },
+      'e/f': 'str',
+      'g/h': { enabled: false },
+      'i/j': { enabled: true },
+      'k/l': { enabled: 'yes' }
+    } } });
+    const rs = (await h.state()).config.routeSettings;
+    assert.deepEqual(rs[KEY], { intervalMinutes: 60, maxIdleMinutes: 1, compactAfterMinutes: 5, compactMinTokens: 5000000 });
+    assert.deepEqual(Object.keys(rs).sort(), [KEY, 'g/h', 'i/j'].sort());
+    assert.deepEqual(rs['g/h'], { enabled: false });
+    assert.deepEqual(rs['i/j'], { enabled: true });
+  });
+
+  test('y2 间隔覆盖：该模型按自己的间隔重放，覆盖优先于 routeIntervals 预设', async () => {
+    h = await setup({ config: { routeSettings: { [KEY]: { intervalMinutes: 2 } }, routeIntervals: { [KEY]: 9 } } });
+    await h.real(HIT);
+    await h.advance(8 * MIN + 30_000);
+    assert.equal(h.streamCalls.length, 4, '2 分钟间隔 → 8.5 分钟 4 次');
+    assert.equal((await h.state()).windows[SID].intervalMinutes, 2);
+  });
+
+  test('y3 最长保活时长覆盖：到点停止，其它模型不受影响', async () => {
+    h = await setup({ config: { maxIdleMinutes: 45, routes: [CLAUDE, OPUS], routeSettings: { [KEY]: { maxIdleMinutes: 8 } } } });
+    await h.real(HIT);
+    await h.advance(20 * MIN);
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'));
+    assert.ok(h.streamCalls.length <= 2, '8 分钟 / 4 分钟 = 2 次');
+    h.teardown();
+    h = await setup({ config: { maxIdleMinutes: 45, routes: [CLAUDE, OPUS], routeSettings: { [KEY]: { maxIdleMinutes: 8 } }, sessionEnabled: { [SID]: true } } });
+    await h.real(HIT, { provider: OPUS.provider, model: OPUS.model });
+    await h.advance(20 * MIN);
+    assert.ok(!h.logLines().some((l) => l.kind === 'stop' && l.reason === 'max-idle'), 'Opus 没有覆盖，仍按 45 分钟');
+  });
+
+  test('y4 压缩时间与压缩下限按模型覆盖，窗口状态用该模型的值', async () => {
+    const comp = mkComp();
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 60, compactMinTokens: 150000, routeSettings: { [KEY]: { compactAfterMinutes: 10, compactMinTokens: 0 } } }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    await h.real(HIT);
+    const win = (await h.state()).windows[SID];
+    assert.equal(win.compactAfterMinutes, 10);
+    assert.equal(win.compactMinTokens, 0);
+    await h.advance(10 * MIN + 30_000);
+    assert.equal(comp.calls, 1, '全局下限 15 万本会拦住小上下文，覆盖为 0 后照常压缩，且 10 分钟就压');
+  });
+
+  test('y5 压缩下限覆盖得更高：该模型的大上下文也不压缩', async () => {
+    const comp = mkComp();
+    h = await setup({ config: { compactEnabled: true, compactAfterMinutes: 10, compactMinTokens: 0, routeSettings: { [KEY]: { compactMinTokens: 400000 } } }, agents: { [SID]: agent('idle', comp) }, compaction: comp });
+    h.replayUsage = { ...BIG };
+    await h.real(BIG);
+    await h.advance(12 * MIN);
+    assert.equal(comp.calls, 0);
+    assert.equal((await h.state()).windows[SID].compactStatus, 'small');
+  });
+
+  test('y6 关闭某模型：不再捕获；已武装的窗口在下一轮扫描停止（route-off）', async () => {
+    h = await setup({ config: { routeSettings: { [KEY]: { enabled: false } } } });
+    await h.real(HIT);
+    await h.advance(10 * MIN);
+    assert.equal(h.streamCalls.length, 0);
+    assert.equal(h.logLines().filter((l) => l.kind === 'capture').length, 0);
+    h.teardown();
+    h = await setup();
+    await h.real(HIT);
+    await h.advance(5 * MIN);
+    const before = h.streamCalls.length;
+    assert.ok(before >= 1);
+    assert.equal((await post({ [KEY]: { enabled: false } })).status, 200);
+    await h.advance(10 * MIN);
+    assert.equal(h.streamCalls.length, before, '关闭后不再重放');
+    assert.ok(h.logLines().some((l) => l.kind === 'stop' && l.reason === 'route-off'));
+  });
+
+  test('y7 /config 的 routeSettings：对象整条替换、null 删除、落盘、校验', async () => {
+    h = await setup();
+    assert.equal((await post({ [KEY]: { intervalMinutes: 3, maxIdleMinutes: 30 } })).status, 200);
+    assert.deepEqual((await h.state()).config.routeSettings[KEY], { intervalMinutes: 3, maxIdleMinutes: 30 });
+    assert.equal((await post({ [KEY]: { compactAfterMinutes: 15 } })).status, 200);
+    assert.deepEqual((await h.state()).config.routeSettings[KEY], { compactAfterMinutes: 15 }, '整条替换：没带的字段回到跟随全局');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, 'config.json'), 'utf8'));
+    assert.deepEqual(onDisk.routeSettings[KEY], { compactAfterMinutes: 15 });
+    assert.equal((await post({ [KEY]: null })).status, 200);
+    assert.equal((await h.state()).config.routeSettings[KEY], undefined);
+    for (const bad of [[1], 'x', null]) assert.equal((await post(bad)).status, 400, JSON.stringify(bad));
+    assert.equal((await post({ 'noslash': { intervalMinutes: 3 } })).status, 400);
+    const many = {};
+    for (let i = 0; i < 51; i += 1) many['p/m' + i] = { intervalMinutes: 5 };
+    assert.equal((await post(many)).status, 400, '最多 50 条');
+  });
+
+  test('y8 state.routes：覆盖、默认、生效值、盈亏线；未出现过的模型只要配置过也会列出', async () => {
+    h = await setup({ config: { routeSettings: { [KEY]: { intervalMinutes: 3 }, 'blsc/GPT-6.1-Sol': { enabled: false } } } });
+    const routes = (await h.state()).routes;
+    const claude = routes.find((r) => r.key === KEY);
+    assert.deepEqual(claude.override, { intervalMinutes: 3 });
+    assert.equal(claude.defaults.intervalMinutes, 4);
+    assert.equal(claude.effective.intervalMinutes, 3);
+    assert.equal(claude.enabled, true);
+    assert.equal(claude.breakEvenTouches, 11, '(2.4306 − 0.1944) / 0.1944 取整');
+    assert.equal(claude.breakEvenMinutes, 33);
+    const gpt = routes.find((r) => r.key === 'blsc/GPT-6.1-Sol');
+    assert.equal(gpt.enabled, false);
+    assert.equal(gpt.enabledExplicit, true);
+    assert.equal(gpt.listed, false, 'routes 里只列了 Claude');
+    assert.equal(claude.listed, true);
+    assert.equal(claude.enabledExplicit, false);
+    assert.equal(gpt.provider, 'blsc');
+    assert.equal(gpt.model, 'GPT-6.1-Sol');
+    assert.equal(gpt.priced, false);
+    assert.equal(gpt.breakEvenTouches, null);
+  });
+
+  test('y9 模型 id 里带斜杠：provider 取第一个斜杠之前', async () => {
+    h = await setup({ config: { routeSettings: { 'openrouter/anthropic/claude-x': { intervalMinutes: 3 } } } });
+    const r = (await h.state()).routes.find((x) => x.key === 'openrouter/anthropic/claude-x');
+    assert.equal(r.provider, 'openrouter');
+    assert.equal(r.model, 'anthropic/claude-x');
+  });
+
+  test('y10 单模型开关盖过 routes 清单：清单外的模型可单独打开，清单内的可单独关闭', async () => {
+    h = await setup({ config: { routes: [CLAUDE], routeSettings: { [OPUS.provider + '/' + OPUS.model]: { enabled: true } }, sessionEnabled: { [SID]: true } } });
+    await h.real(HIT, { provider: OPUS.provider, model: OPUS.model });
+    await h.advance(5 * MIN);
+    assert.ok(h.streamCalls.length >= 1, '不在 routes 里的 Opus 被单独打开后保活');
+    const opus = (await h.state()).routes.find((r) => r.key === OPUS.provider + '/' + OPUS.model);
+    assert.equal(opus.listed, false);
+    assert.equal(opus.enabled, true);
+    assert.equal(opus.enabledExplicit, true);
+    assert.equal((await post({ [OPUS.provider + '/' + OPUS.model]: null })).status, 200);
+    const again = (await h.state()).routes.find((r) => r.key === OPUS.provider + '/' + OPUS.model);
+    assert.equal(again.enabled, false, '去掉单独选择后回到 routes 清单的结果');
+  });
+});

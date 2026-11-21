@@ -125,6 +125,34 @@ window.__ModuleLoader__.load({
 .ka-table .r{text-align:right}
 .ka-table th.r{text-align:right}
 .ka-foot{margin:0;font-size:11.5px;line-height:1.6;color:var(--ka-fg3)}
+.ka-models{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.ka-mc{display:flex;flex-direction:column;gap:12px;min-width:0;padding:14px;background:var(--ka-l1);border:1px solid var(--ka-b1);border-radius:var(--ka-rl);transition:border-color .15s,box-shadow .15s}
+.ka-mc.is-custom{border-color:color-mix(in srgb,var(--ka-brand) 40%,var(--ka-b1))}
+.ka-mc.is-off .ka-mc-g,.ka-mc.is-off .ka-mc-sum{opacity:.45}
+.ka-mc-h{display:flex;align-items:flex-start;gap:10px}
+.ka-mc-n{flex:1 1 auto;min-width:0}
+.ka-mc-t{font-size:14px;font-weight:600;letter-spacing:-.005em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ka-mc-p{margin-top:1px;font-size:11.5px;color:var(--ka-fg3);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ka-mc-chips{display:flex;flex-wrap:wrap;gap:4px 6px}
+.ka-mc-g{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;transition:opacity .15s}
+.ka-fld{display:flex;flex-direction:column;gap:4px;min-width:0}
+.ka-fld>span{font-size:12px;color:var(--ka-fg2)}
+.ka-fld>small{font-size:11px;color:var(--ka-fg3);font-variant-numeric:tabular-nums}
+.ka-fld-i{display:flex;align-items:center;height:30px;padding:0 4px 0 10px;background:var(--ka-base);border:1px solid var(--ka-b2);border-radius:var(--ka-rm);transition:border-color .15s,box-shadow .15s}
+.ka-fld-i:hover{border-color:var(--ka-fg3)}
+.ka-fld-i:focus-within{border-color:var(--ka-brand);box-shadow:0 0 0 3px color-mix(in srgb,var(--ka-brand) 22%,transparent)}
+.ka-fld.is-set .ka-fld-i{border-color:color-mix(in srgb,var(--ka-brand) 60%,var(--ka-b2))}
+.ka-fld.is-bad .ka-fld-i{border-color:var(--ka-err);box-shadow:0 0 0 3px color-mix(in srgb,var(--ka-err) 16%,transparent)}
+.ka-fld-i input{flex:1 1 auto;min-width:0;width:100%;padding:0;border:none;outline:none;background:transparent;font-variant-numeric:tabular-nums;appearance:textfield;-moz-appearance:textfield}
+.ka-fld-i input::-webkit-outer-spin-button,.ka-fld-i input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.ka-fld-i input::placeholder{color:var(--ka-fg3);opacity:.75}
+.ka-fld-i em{flex:0 0 auto;padding:0 7px 0 4px;font-style:normal;font-size:11px;color:var(--ka-fg3);white-space:nowrap}
+.ka-mc-sum{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;font-size:12px;color:var(--ka-fg2);transition:opacity .15s}
+.ka-mc-f{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--ka-b1)}
+.ka-mc-s{flex:1 1 120px;min-width:0;font-size:12px;color:var(--ka-fg3)}
+.ka-add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:12px 14px;border:1px dashed var(--ka-b2);border-radius:var(--ka-rl);color:var(--ka-fg2);font-size:12px}
+.ka-add input{flex:1 1 220px;min-width:0;height:28px;padding:0 10px;background:var(--ka-base);border:1px solid var(--ka-b2);border-radius:var(--ka-rm);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.ka-add input:focus{outline:none;border-color:var(--ka-brand);box-shadow:0 0 0 3px color-mix(in srgb,var(--ka-brand) 22%,transparent)}
 `;
       function useKaStyle() {
         React.useLayoutEffect(() => {
@@ -270,6 +298,195 @@ window.__ModuleLoader__.load({
         }
         if (view !== 'page') return null;
         return h(SettingsPage, status);
+      }
+
+      // ---- Per-model settings ---------------------------------------------
+      // Every field is optional: empty = follow the global setting (placeholder shows what that is).
+      const ROUTE_FIELDS = [
+        { key: 'intervalMinutes', label: '保活间隔', unit: '分钟', min: 1, max: 60 },
+        { key: 'maxIdleMinutes', label: '最长保活时长', unit: '分钟', min: 1, max: 1440 },
+        { key: 'compactAfterMinutes', label: '空闲多久后压缩', unit: '分钟', min: 5, max: 120 },
+        { key: 'compactMinTokens', label: '小于多少不压缩', unit: 'token', min: 0, max: 5000000 }
+      ];
+      // '' -> follow global; otherwise an integer inside the range.
+      function parseRouteField(spec, raw) {
+        const text = String(raw === null || raw === undefined ? '' : raw).trim();
+        if (text === '') return { ok: true, value: undefined };
+        const value = Number(text);
+        if (!Number.isFinite(value) || !Number.isInteger(value) || value < spec.min || value > spec.max) return { ok: false, error: spec.min + '–' + spec.max + ' 的整数' };
+        return { ok: true, value };
+      }
+      function kTokens(value) {
+        if (typeof value !== 'number') return '—';
+        if (value === 0) return '不限';
+        return value >= 1000 ? Math.round(value / 1000) + 'k' : String(value);
+      }
+
+      function RouteCard({ route, refresh, draft, onDone }) {
+        const [edits, setEdits] = React.useState({});
+        const [offEdit, setOffEdit] = React.useState(null);
+        const [busy, setBusy] = React.useState(false);
+        const [msg, setMsg] = React.useState(null);
+        React.useEffect(() => {
+          if (!msg || msg.kind !== 'ok') return undefined;
+          const timer = setTimeout(() => setMsg(null), 2600);
+          return () => clearTimeout(timer);
+        }, [msg]);
+
+        const override = route.override || {};
+        const enabled = offEdit === null ? route.enabled !== false : offEdit;
+        // Only a choice that differs from what config.routes gives is stored.
+        const listed = route.listed !== false;
+        const rawOf = (key) => (edits[key] !== undefined ? edits[key] : override[key] === undefined ? '' : String(override[key]));
+        const parsed = {};
+        let bad = 0;
+        let changed = offEdit !== null && offEdit !== (route.enabled !== false) ? 1 : 0;
+        ROUTE_FIELDS.forEach((spec) => {
+          const result = parseRouteField(spec, rawOf(spec.key));
+          parsed[spec.key] = result;
+          if (!result.ok) bad += 1;
+          else if (result.value !== override[spec.key]) changed += 1;
+        });
+        const customCount = ROUTE_FIELDS.filter((spec) => parsed[spec.key].ok && parsed[spec.key].value !== undefined).length + (enabled !== listed ? 1 : 0);
+        const dirty = changed > 0 || bad > 0;
+        const defaults = route.defaults || {};
+        // What this card would give once saved (live preview, same rules as the Host).
+        const eff = {};
+        ROUTE_FIELDS.forEach((spec) => {
+          eff[spec.key] = parsed[spec.key].ok && parsed[spec.key].value !== undefined ? parsed[spec.key].value : defaults[spec.key];
+        });
+        const touches = typeof eff.intervalMinutes === 'number' && eff.intervalMinutes > 0 ? Math.floor(eff.maxIdleMinutes / eff.intervalMinutes) : null;
+        const be = route.breakEvenTouches;
+        const overBreakEven = typeof be === 'number' && typeof touches === 'number' && touches > be;
+        const hadSaved = Object.keys(override).length > 0 || route.enabledExplicit === true;
+
+        const save = async (clear) => {
+          if (busy || (bad > 0 && !clear)) return;
+          const entry = {};
+          if (!clear) {
+            ROUTE_FIELDS.forEach((spec) => { if (parsed[spec.key].value !== undefined) entry[spec.key] = parsed[spec.key].value; });
+            if (enabled !== listed) entry.enabled = enabled;
+          }
+          setBusy(true);
+          setMsg(null);
+          try {
+            const res = await fetch(API + '/config', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-keepalive': '1' },
+              body: JSON.stringify({ routeSettings: { [route.key]: Object.keys(entry).length > 0 ? entry : null } })
+            });
+            const json = await res.json().catch(() => null);
+            if (!res.ok) throw new Error(json && json.error ? json.error : 'HTTP ' + res.status);
+            await refresh();
+            setEdits({});
+            setOffEdit(null);
+            setMsg({ kind: 'ok', text: clear ? '已恢复为跟随全局' : '已保存' });
+            if (draft && onDone) onDone(route.key);
+          } catch (e) {
+            setMsg({ kind: 'err', text: '保存失败：' + String((e && e.message) || e) });
+          } finally {
+            setBusy(false);
+          }
+        };
+
+        const field = (spec) => {
+          const result = parsed[spec.key];
+          const isSet = result.ok && result.value !== undefined;
+          return h('label', { key: spec.key, className: cx('ka-fld', isSet && 'is-set', !result.ok && 'is-bad') },
+            h('span', null, spec.label),
+            h('div', { className: 'ka-fld-i' },
+              h('input', {
+                type: 'number',
+                inputMode: 'numeric',
+                step: 1,
+                min: spec.min,
+                max: spec.max,
+                value: rawOf(spec.key),
+                placeholder: '跟随 ' + (spec.key === 'compactMinTokens' ? kTokens(defaults[spec.key]) : defaults[spec.key]),
+                'aria-label': route.model + ' ' + spec.label,
+                'aria-invalid': result.ok ? 'false' : 'true',
+                onChange: (e) => { setMsg(null); setEdits((prev) => ({ ...prev, [spec.key]: e.target.value })); }
+              }),
+              h('em', null, spec.unit)
+            ),
+            !result.ok ? h('small', { className: 'ka-tone-err', role: 'alert' }, '请输入 ' + result.error) : null
+          );
+        };
+
+        return h('div', { className: cx('ka-mc', customCount > 0 && 'is-custom', !enabled && 'is-off') },
+          h('div', { className: 'ka-mc-h' },
+            h('div', { className: 'ka-mc-n' },
+              h('div', { className: 'ka-mc-t', title: route.model }, route.model),
+              h('div', { className: 'ka-mc-p', title: route.key }, route.provider)
+            ),
+            h('div', { className: 'ka-ctl', title: enabled ? '该模型参与保活' : !listed ? '该模型不在 config.json 的 routes 清单里，所以不保活；打开开关即可' : '该模型不保活' },
+              h('span', { className: 'ka-sub' }, enabled ? '保活' : '已关闭'),
+              h(Switch, { checked: enabled, onChange: (v) => { setMsg(null); setOffEdit(v); }, label: route.model + ' 保活开关' })
+            )
+          ),
+          h('div', { className: 'ka-mc-chips' },
+            route.proven ? h('span', { className: 'ka-chip ok', title: '这条线路的真实请求已读到缓存' }, '缓存已验证') : h('span', { className: 'ka-chip', title: '还没在这条线路上看到过缓存命中；看到之后才会保活' }, '待验证'),
+            route.windows > 0 ? h('span', { className: 'ka-chip' }, route.windows + ' 个窗口在用') : null,
+            !listed ? h('span', { className: 'ka-chip', title: 'config.json 的 routes 清单里没有这个模型；打开右上角开关就会对它保活' }, '不在线路清单') : null,
+            customCount > 0 ? h('span', { className: 'ka-chip warn' }, '自定义 ' + customCount + ' 项') : h('span', { className: 'ka-chip' }, '全部跟随全局'),
+            draft ? h('span', { className: 'ka-chip' }, '新添加，保存后生效') : null
+          ),
+          h('div', { className: 'ka-mc-g' }, ROUTE_FIELDS.map(field)),
+          h('div', { className: 'ka-mc-sum' },
+            typeof touches === 'number' ? h('span', { className: 'ka-derived' }, touches < 1 ? '最长时长不足一个间隔' : '最多约 ' + touches + ' 次保活') : null,
+            typeof be === 'number'
+              ? h('span', { className: cx('ka-chip', overBreakEven ? 'warn' : 'ok'), title: '保活 k 次的花费约等于 k 次缓存读；缓存过期后重写要多付「写价−读价」，k 超过 (写价−读价)÷读价 就不如不保活' },
+                  (overBreakEven ? '超过盈亏线 ' : '盈亏线 ') + be + ' 次' + (typeof route.breakEvenMinutes === 'number' ? ' ≈ ' + route.breakEvenMinutes + ' 分钟' : ''))
+              : h('span', { className: 'ka-chip', title: '这条线路没有单价，估算不到盈亏线；可在 config.json 的 prices 里加' }, '无单价')
+          ),
+          h('div', { className: 'ka-mc-f' },
+            h('span', { className: cx('ka-mc-s', msg && 'ka-tone-' + (msg.kind === 'ok' ? 'ok' : 'err')) },
+              busy ? '保存中…' : msg ? (msg.kind === 'ok' ? '✓ ' : '') + msg.text : bad > 0 ? bad + ' 项无效' : changed > 0 ? '有未保存的更改' : ''),
+            dirty && !busy ? h('button', { type: 'button', className: 'ka-btn ka-btn--sm', onClick: () => { setEdits({}); setOffEdit(null); setMsg(null); } }, '还原') : null,
+            !dirty && hadSaved && !busy ? h('button', { type: 'button', className: 'ka-btn ka-btn--sm', onClick: () => void save(true) }, '恢复全局') : null,
+            h('button', { type: 'button', className: 'ka-btn ka-btn--sm ka-btn--primary', disabled: !dirty || bad > 0 || busy, onClick: () => void save(false) }, '保存')
+          )
+        );
+      }
+
+      function RouteSettings({ routes, config, loaded, refresh }) {
+        const [drafts, setDrafts] = React.useState([]);
+        const [name, setName] = React.useState('');
+        const [addError, setAddError] = React.useState(null);
+        const known = new Set(routes.map((r) => r.key));
+        const shown = routes.slice();
+        drafts.forEach((key) => {
+          if (known.has(key)) return;
+          const at = key.indexOf('/');
+          shown.push({ key, provider: key.slice(0, at), model: key.slice(at + 1), override: {}, defaults: { intervalMinutes: config.intervalMinutes, maxIdleMinutes: config.maxIdleMinutes, compactAfterMinutes: config.compactAfterMinutes, compactMinTokens: config.compactMinTokens }, enabled: !(Array.isArray(config.routes) && config.routes.length > 0), listed: !(Array.isArray(config.routes) && config.routes.length > 0), proven: false, windows: 0, breakEvenTouches: null, draft: true });
+        });
+        // Customised first, then the ones in use, then by name.
+        shown.sort((a, b) => {
+          const ca = Object.keys(a.override || {}).length > 0 || a.enabledExplicit ? 0 : 1;
+          const cb = Object.keys(b.override || {}).length > 0 || b.enabledExplicit ? 0 : 1;
+          return ca - cb || (b.windows || 0) - (a.windows || 0) || a.key.localeCompare(b.key);
+        });
+        const add = () => {
+          const key = name.trim();
+          const at = key.indexOf('/');
+          if (at <= 0 || at === key.length - 1) { setAddError('格式：provider/model，例如 blsc/GPT-6.1-Sol'); return; }
+          setAddError(null);
+          setName('');
+          setDrafts((prev) => (prev.includes(key) ? prev : [...prev, key]));
+        };
+        return h('section', { className: 'ka-group' },
+          h('div', { className: 'ka-gh' }, h('h3', { className: 'ka-gt' }, '按模型设置'), h('span', { className: 'ka-gd' }, '不同模型的缓存寿命和价格不同，可以各自覆盖上面的全局设置；留空 = 跟随全局')),
+          !loaded ? h('div', { className: 'ka-card' }, h('div', { className: 'ka-empty' }, '读取中…'))
+            : shown.length === 0 ? h('div', { className: 'ka-card' }, h('div', { className: 'ka-empty' }, h('strong', null, '还没有用过的模型'), '在对话窗口里打开「保活」并聊几句后，这里会列出它所用的模型；也可以在下面直接添加。'))
+              : h('div', { className: 'ka-models' }, shown.map((route) => h(RouteCard, { key: route.key, route, refresh, draft: route.draft === true, onDone: (key) => setDrafts((prev) => prev.filter((k) => k !== key)) }))),
+          h('div', { className: 'ka-add' },
+            h('span', null, '添加模型'),
+            h('input', { value: name, placeholder: 'provider/model，例如 blsc/GPT-6.1-Sol', 'aria-label': '添加模型', spellCheck: false, onChange: (e) => { setName(e.target.value); setAddError(null); }, onKeyDown: (e) => { if (e.key === 'Enter') add(); } }),
+            h('button', { type: 'button', className: 'ka-btn ka-btn--sm', onClick: add, disabled: name.trim().length === 0 }, '添加'),
+            addError ? h('span', { className: 'ka-tone-err', role: 'alert' }, addError) : null
+          ),
+          h('p', { className: 'ka-foot' }, '「盈亏线」按这条线路的单价算：保活次数超过它，花的钱就比让缓存过期再重写更多。没有单价的线路在 config.json 的 prices 里补；内置预设（如 kimi 的 20 分钟间隔）显示为「跟随」后面的数字。')
+        );
       }
 
       function SettingsPage({ state, error, refresh, receivedAt }) {
@@ -479,6 +696,8 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'ka-btn ka-btn--primary', disabled: !canSave, onClick: save }, busy ? '保存中…' : '保存')
           ),
 
+          h(RouteSettings, { routes: (state && state.routes) || [], config, loaded, refresh }),
+
           h('section', { className: 'ka-group' },
             h('div', { className: 'ka-gh' }, h('h3', { className: 'ka-gt' }, '当前跟踪的会话'), h('span', { className: 'ka-gs ka-num' }, loaded && sessions.length > 0 ? sessions.length + ' 个' : '')),
             h('div', { className: 'ka-card' },
@@ -541,7 +760,7 @@ window.__ModuleLoader__.load({
             ),
             h('span', { className: 'ka-chips' },
               h('span', { className: cx('ka-chip', s.enabled ? 'ok' : '') }, s.enabled ? '保活开' : '保活关'),
-              s.enabled ? compactChip(win, s, compactMinutes, now, receivedAt) : null,
+              s.enabled ? compactChip(win, s, (win && win.compactAfterMinutes) || compactMinutes, now, receivedAt) : null,
               s.enabled && !s.armed ? h('span', { className: 'ka-chip' }, '待首次命中') : null,
               s.enabled && s.stopped ? h('span', { className: 'ka-chip err' }, '本轮已停') : null
             ),
@@ -1067,7 +1286,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { opacity: enabled === true ? 1 : 0.6 } }, missing ? '保活?' : '保活')
         );
 
-        const compactMinutes = (config && config.compactAfterMinutes) || 20;
+        const compactMinutes = (state && state.windows && state.windows[sessionId] && state.windows[sessionId].compactAfterMinutes) || (config && config.compactAfterMinutes) || 20;
         const compactDim = missing || enabled !== true;
         const compactPill = missing ? null : h('button', {
           type: 'button',

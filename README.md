@@ -82,8 +82,8 @@ saves nothing and only burns quota - leave those routes out of `config.routes`.
   there is none: off, keep-alive off, waiting for the next message, running, done, cleared by a manual
   `/compact`, or this idle gap already stopped) and the time of the last compaction.
 - **Settings (⌘,) → 缓存保活**, and the same page on the sidebar **Plugins** page (Official group, and the
-  plugin row's *Configure*): status blocks, the editable settings below, the tracked sessions with a
-  countdown to their next keep-alive, and a per-conversation record list (click a row for the
+  plugin row's *Configure*): status blocks, the editable settings below, a **per-model settings** section (one
+  card per model, see below), the tracked sessions with a countdown to their next keep-alive, and a per-conversation record list (click a row for the
   per-touch detail, delete with confirmation).
 - **Chat**: nothing. No message, no badge, no tool call.
 
@@ -96,8 +96,29 @@ saves nothing and only burns quota - leave those routes out of `config.routes`.
 | max keep-alive duration | 45 min (1-1440) | the only length cap per idle gap. The number of keep-alives is *derived*: `floor(duration / interval)`, shown read-only. 45 min keeps a Claude-class route below its break-even |
 | replay output cap | 16 (2-64) | `maxTokens` of the replay. At least 2: some relays short-circuit `max_tokens: 1` without touching the cache |
 | compaction default / minutes | off / 20 (5-120) | a window with compaction on, idle that long, is compacted once and keep-alive stops for it |
+| minimum context to compact (`compactMinTokens`) | 150000 (0 = no minimum) | a window whose context (the prompt of its last real request or replay) is below this is not compacted; its keep-alive cap stays `maxIdleMinutes`. Size unknown = compaction allowed |
 | clear countdown on manual compaction | on | when the user runs `/compact` in a window the plugin tracks, that window's auto-compaction countdown is cleared: the now-obsolete request snapshot is dropped and keep-alive/compaction wait for the next real request, which starts a fresh countdown. Off = manual compaction is ignored |
 | skip compaction while work is running | on | a background job or subagent of that window still running postpones its auto-compaction (re-checked every scan) until it finishes. Off = only the agent's own idle state is checked |
+
+### Per-model settings
+
+Cache lifetimes and prices differ per model, so four of the settings above can be overridden for one model
+(`provider/model`): keep-alive **interval**, **max keep-alive duration**, **compaction idle minutes** and
+**minimum context to compact**, plus a keep-alive switch for the model (it wins over `config.routes` in both directions:
+off = never, on = also when the model is not in the `routes` list; no choice stored = follow `routes`). The settings
+page shows one card per model it knows (seen in the log, in a tracked window, in `routes`, or already configured; models
+never used can be added by typing `provider/model`). An empty field follows the global setting (the
+placeholder shows what that is; the built-in kimi intervals count as the default for those two models).
+Each card saves on its own, and "恢复全局" removes all of its overrides. A card also shows how many keep-alives
+fit in the max duration and, when the model has a price, the **break-even** `floor((write − hit) / hit)`
+keep-alives (a warning chip when the configured duration goes past it).
+
+- Stored in `config.routeSettings` (`{ "provider/model": { intervalMinutes?, maxIdleMinutes?,
+  compactAfterMinutes?, compactMinTokens?, enabled? } }`, ranges as for the global fields; at most 50 entries). Precedence: the model's own value, then (interval only) `routeIntervals`, then the
+  global setting.
+- Switching a model off stops the windows already armed on it at the next scan (`stop` with `route-off`) and
+  nothing new is captured for it. Other changes apply from the next scan.
+- A window uses the values of the model of its last real request; the composer cards and the session list show them.
 
 `maxTouches` (the old setting) is gone; a leftover `maxTouches` in `config.json` is ignored and noted
 in the log (`config-notice`).
@@ -106,7 +127,7 @@ in the log (`config-notice`).
 
 Had the cache expired, the next real request would have paid a cache write for the whole prefix
 instead of a cache read, so the avoided cost of an idle gap that ended in a real request is
-`C × (cold − hit)` (a gap that is still idle has not ended yet: it only subtracts what it has cost so far), where `cold` is the cache-write price (kimi bills an expired prefix at input +
+`C × (cold − hit)`, where `C` is the largest cacheRead seen in that gap (a gap that is still idle has not ended yet: it only subtracts what it has cost so far), where `cold` is the cache-write price (kimi bills an expired prefix at input +
 write, so its entries carry `miss: "input+write"`). The estimate subtracts what the replays cost:
 
 ```
@@ -126,7 +147,8 @@ saving. All figures are estimates, not a bill.
 - **Follows the session's model.** It captures the latest real `llm/stream` request per session and
   replays with that request's own provider/model. `config.routes: []` means "any route"; fill it to
   restrict. Per-route pacing lives in `config.routeIntervals` (kimi-coding 20 min, huosan 4 min),
-  falling back to `config.intervalMinutes`.
+  falling back to `config.intervalMinutes`; every per-model override (interval, max duration, compaction
+  minutes, compaction minimum, off switch) lives in `config.routeSettings` (see "Per-model settings").
 - **Only arms a route it has proof for.** A route is armed only after a real request on it reported a
   genuine cache hit (`cacheRead >= 1024` and `>= 20%` of the prompt). Replays never self-certify.
 - Skips subagent/fork sessions, requests with a `purpose` (compaction, titles...) and its own replays.
@@ -151,7 +173,7 @@ saving. All figures are estimates, not a bill.
   idle cap, `max(maxIdleMinutes, compactAfterMinutes + 1)`, then stops. When the work ends, its completion notice wakes
   the agent; that real request re-arms the window and restarts both countdowns, so a long task is never compacted at
   its end just because the idle time had long passed. (Keep-alive for k touches pays off while
-  `k ≤ write/hit − 1`, independent of context size: ~11 touches ≈ 46 min on the relay, ~24 ≈ 95 min at list price; keep
+  `k ≤ write/hit − 1`, independent of context size: ~11 touches ≈ 46 min on the relay, ~24 ≈ 96 min at list price; keep
   `maxIdleMinutes` below that.) Only `job` and `subagent` entries count (a pending `schedule` entry, e.g. a reminder due next week, does not). The check asks DSH's `workspace/session-activity` question (the one it asks before archiving a session);
   a host without it is treated as "nothing running", and a failing check postpones the round. A turn that is merely
   waiting on a tool call or subagent has agent status `running`, which was already never compacted. The window is marked stopped *before* the call, so a
@@ -176,7 +198,7 @@ prompt text.
 | method + path | purpose |
 |---|---|
 | `GET /plugins/cache-keepalive/state` | config (with the derived `maxTouches`), counters, tracked sessions, per-task records, and `windows` (numbers since that window was switched on, with the interval/limit of its route) |
-| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactSkipWhenBusy`, `compactMinTokens`, `compactResetOnManual`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped |
+| `POST /plugins/cache-keepalive/config` | merge a JSON patch of whitelisted fields (`enabled`, `compactEnabled`, `compactSkipWhenBusy`, `compactMinTokens`, `compactResetOnManual`, `compactAfterMinutes`, `intervalMinutes`, `maxIdleMinutes`, `replayMaxTokens`, `scanSeconds`, `maxSessions`); values are clamped. `routeSettings` is also accepted: `{ "provider/model": {fields} \| null }`, an object replaces that model's overrides, `null` removes them |
 | `POST /plugins/cache-keepalive/session` | `{"session":"<id>","enabled"?:bool,"compact"?:bool}`: one window's switches |
 | `GET /plugins/cache-keepalive/task?session=<id>` | one task record plus its per-touch detail |
 | `POST /plugins/cache-keepalive/task/delete` | `{"session":"<id>"}`: forget that task record |
@@ -187,7 +209,7 @@ prompt text.
 | file | purpose |
 |---|---|
 | `config.json` | live config (not committed), including the per-window `sessionEnabled` / `sessionCompact` maps; hot-reloaded every 2 s (a file that is not valid JSON is ignored and the previous settings are kept); written atomically. `scanSeconds` takes effect after a reload |
-| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `defer`, `compact` (incl. `postponed`), `config`, `session-switch`, `compact-switch`, `record-deleted` |
+| `keepalive.jsonl` | append-only log (not committed): `start`, `capture`, `keepalive`, `stop`, `defer`, `compact` (incl. `postponed`), `config`, `session-switch`, `compact-switch`, `record-deleted`, `config-notice`, `config-error` |
 
 ## Limits
 
@@ -197,7 +219,8 @@ prompt text.
 - Task names come from the session title; a session without a generated title yet falls back to `会话 <short id>`.
 - Deleting a record removes its `keepalive` lines from `keepalive.jsonl` and stops the current idle gap for that
   session (the `session-switch` lines stay: they hold the "本次开启" start); it does not toggle the keep-alive.
-- No UI for adding routes or prices yet; edit `config.json` (`routes`, `routeIntervals`, `prices`).
+- No UI for the allow-list or prices yet; edit `config.json` (`routes`, `prices`). Models are tuned in the
+  settings page (`routeSettings`); `routeIntervals` is the built-in preset the per-model interval falls back to.
 - The settings page texts are Chinese only.
 
 ## Tests

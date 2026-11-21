@@ -21,6 +21,12 @@
     "kimi-coding/kimi-k3.1-pro": 20,
     "huosan/kimi-k3.1-pro": 4
   },
+  "routeSettings": {
+    "blsc/GPT-6.1-Sol": {
+      "maxIdleMinutes": 90,
+      "compactMinTokens": 300000
+    }
+  },
   "prices": {},
   "requireProvenCache": true,
   "compactEnabled": false,
