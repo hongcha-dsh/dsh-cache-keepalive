@@ -17,7 +17,7 @@
  *   - Only user-visible main sessions are armed (subagent/fork sessions skipped).
  *   - Only routes listed in config.routes are touched.
  *   - A replay that misses (cacheRead === 0) disables that session immediately.
- *   - Hard caps: maxTouches per idle gap, maxIdleMinutes, one replay in flight.
+ *   - Hard caps: maxIdleMinutes per idle gap (the touch count is derived from it: maxIdleMinutes / interval), one replay in flight.
  *   - Config is re-read from config.json when the file changes (2s poll).
  */
 
@@ -33,19 +33,66 @@ const DEFAULTS = {
   enabled: false,
   /** sessionId -> boolean: the per-conversation switch owned by the composer pill. */
   sessionEnabled: {},
-  intervalMinutes: 20,
-  maxIdleMinutes: 150,
-  maxTouches: 8,
+  /** Must stay below the route's cache TTL; Claude's is 5 min, so 4 is the safe default. */
+  intervalMinutes: 4,
+  maxIdleMinutes: 45,
+  /** Idle minutes (5-120) before a compaction-enabled window is compacted once, after which keep-alive stops for it. */
+  compactAfterMinutes: 20,
+  /** Default for a window that never chose explicitly. Off: compaction is always opt-in per window. */
+  compactEnabled: false,
+  /** A manual compaction (the user's /compact) clears that window's auto-compaction countdown: the obsolete snapshot is dropped and keep-alive/compaction wait for the next real request. */
+  compactResetOnManual: true,
+  /** Do not auto-compact a window while a background job or a subagent it started is still running (the agent itself is idle, so its status alone does not show it). */
+  compactSkipWhenBusy: true,
+  /** Do not auto-compact a window whose context is below this many tokens (compacting a small context costs more than it saves; see docs/ECONOMICS.md). 0 = no minimum. */
+  compactMinTokens: 150000,
+  /** sessionId -> boolean: the per-window compaction switch (needs that window's keep-alive on). */
+  sessionCompact: {},
+  /** Optional per-route price override (CNY / 1M tokens), keyed "provider/model": { hit, input, output, write }. */
+  prices: {},
   replayMaxTokens: 16,
-  scanSeconds: 30,
-  maxSessions: 1,
+  scanSeconds: 15,
+  maxSessions: 3,
   /** Empty list = follow whatever model the conversation is using. */
   routes: [],
   /** Optional per-route interval override, keyed "provider/model". */
-  routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20, 'huosan/kimi-k3.1-pro': 5 },
+  routeIntervals: { 'kimi-coding/kimi-k3.1-pro': 20, 'huosan/kimi-k3.1-pro': 4 },
+  /**
+   * Per-model overrides, keyed "provider/model". Every field is optional; a missing one follows the global
+   * setting (interval also follows routeIntervals). enabled: false = never keep this model alive; enabled: true = keep it
+   * alive even if config.routes does not list it; absent = follow config.routes.
+   * Fields: intervalMinutes, maxIdleMinutes, compactAfterMinutes, compactMinTokens, enabled.
+   */
+  routeSettings: {},
   /** Arm a route only after a real request on it reported cacheRead > 0. */
   requireProvenCache: true
 };
+
+/** Per-model override ranges: the same ones the global settings use. */
+const ROUTE_FIELD_RANGES = {
+  intervalMinutes: { min: 1, max: 60, integer: false },
+  maxIdleMinutes: { min: 1, max: 1440, integer: false },
+  compactAfterMinutes: { min: 5, max: 120, integer: false },
+  compactMinTokens: { min: 0, max: 5_000_000, integer: true }
+};
+
+function normalizeRouteSettings(raw) {
+  const out = {};
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.includes('/') || value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const entry = {};
+    for (const [field, range] of Object.entries(ROUTE_FIELD_RANGES)) {
+      if (value[field] === undefined || value[field] === null || value[field] === '') continue;
+      const number = Number(value[field]);
+      if (!Number.isFinite(number)) continue;
+      entry[field] = Math.min(Math.max(range.integer ? Math.floor(number) : number, range.min), range.max);
+    }
+    if (typeof value.enabled === 'boolean') entry.enabled = value.enabled;
+    if (Object.keys(entry).length > 0) out[key] = entry;
+  }
+  return out;
+}
 
 function normalizeConfig(raw) {
   const cfg = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) };
@@ -56,10 +103,11 @@ function normalizeConfig(raw) {
   if (cfg.routeIntervals && typeof cfg.routeIntervals === 'object') {
     for (const [key, value] of Object.entries(cfg.routeIntervals)) {
       const minutes = Number(value);
-      if (typeof key === 'string' && Number.isFinite(minutes) && minutes > 0) intervals[key] = minutes;
+      if (typeof key === 'string' && Number.isFinite(minutes) && minutes > 0) intervals[key] = Math.min(Math.max(minutes, 1), 60);
     }
   }
   cfg.routeIntervals = intervals;
+  cfg.routeSettings = normalizeRouteSettings(cfg.routeSettings);
   const perSession = {};
   if (cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' && !Array.isArray(cfg.sessionEnabled)) {
     for (const [sessionId, value] of Object.entries(cfg.sessionEnabled)) {
@@ -70,25 +118,64 @@ function normalizeConfig(raw) {
   cfg.requireProvenCache = cfg.requireProvenCache !== false;
   if (!Number.isFinite(cfg.intervalMinutes) || cfg.intervalMinutes <= 0) cfg.intervalMinutes = DEFAULTS.intervalMinutes;
   if (!Number.isFinite(cfg.maxIdleMinutes) || cfg.maxIdleMinutes <= 0) cfg.maxIdleMinutes = DEFAULTS.maxIdleMinutes;
-  if (!Number.isFinite(cfg.maxTouches) || cfg.maxTouches < 1) cfg.maxTouches = DEFAULTS.maxTouches;
+  // Legacy key: the touch count is now derived from maxIdleMinutes / intervalMinutes, never configured.
+  delete cfg.maxTouches;
+  cfg.intervalMinutes = Math.min(Math.max(cfg.intervalMinutes, 1), 60);
+  cfg.maxIdleMinutes = Math.min(cfg.maxIdleMinutes, 1440);
   if (!Number.isFinite(cfg.replayMaxTokens) || cfg.replayMaxTokens < 1) cfg.replayMaxTokens = DEFAULTS.replayMaxTokens;
+  // >= 2: a relay may short-circuit max_tokens=1 without touching the cache.
+  cfg.replayMaxTokens = Math.min(Math.max(Math.floor(cfg.replayMaxTokens), 2), 64);
   if (!Number.isFinite(cfg.scanSeconds) || cfg.scanSeconds < 5) cfg.scanSeconds = DEFAULTS.scanSeconds;
+  cfg.scanSeconds = Math.min(cfg.scanSeconds, 300);
   if (!Number.isFinite(cfg.maxSessions) || cfg.maxSessions < 1) cfg.maxSessions = DEFAULTS.maxSessions;
+  cfg.maxSessions = Math.min(Math.floor(cfg.maxSessions), 10);
+  const compact = Number(cfg.compactAfterMinutes);
+  cfg.compactAfterMinutes = Number.isFinite(compact) && compact > 0 ? Math.min(120, Math.max(5, compact)) : DEFAULTS.compactAfterMinutes;
+  cfg.compactEnabled = cfg.compactEnabled === true;
+  cfg.compactResetOnManual = cfg.compactResetOnManual !== false;
+  cfg.compactSkipWhenBusy = cfg.compactSkipWhenBusy !== false;
+  const minTokens = Number(cfg.compactMinTokens);
+  cfg.compactMinTokens = cfg.compactMinTokens === undefined || cfg.compactMinTokens === null || !Number.isFinite(minTokens) || minTokens < 0 ? DEFAULTS.compactMinTokens : Math.min(Math.floor(minTokens), 5_000_000);
+  const perSessionCompact = {};
+  if (cfg.sessionCompact && typeof cfg.sessionCompact === 'object' && !Array.isArray(cfg.sessionCompact)) {
+    for (const [sessionId, value] of Object.entries(cfg.sessionCompact)) {
+      if (typeof sessionId === 'string' && sessionId.length > 0 && typeof value === 'boolean') perSessionCompact[sessionId] = value;
+    }
+  }
+  cfg.sessionCompact = perSessionCompact;
+  const prices = {};
+  if (cfg.prices && typeof cfg.prices === 'object' && !Array.isArray(cfg.prices)) {
+    for (const [key, value] of Object.entries(cfg.prices)) {
+      if (value && [value.hit, value.input, value.output, value.write].every((n) => Number.isFinite(Number(n)) && Number(n) >= 0)) {
+        prices[key] = { hit: Number(value.hit), input: Number(value.input), output: Number(value.output), write: Number(value.write), ...(value.miss === 'input+write' ? { miss: 'input+write' } : {}) };
+      }
+    }
+  }
+  cfg.prices = prices;
   cfg.enabled = cfg.enabled === true;
   return cfg;
 }
 
+/** Missing file -> defaults. A file that exists but cannot be parsed -> null, so callers keep the config they already have. */
 function loadConfig() {
+  let raw;
   try {
-    return normalizeConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
+    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
   } catch {
     return normalizeConfig(DEFAULTS);
+  }
+  try {
+    return normalizeConfig(JSON.parse(raw));
+  } catch {
+    return null;
   }
 }
 
 function saveConfig(cfg) {
   const normalized = normalizeConfig(cfg);
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(normalized, null, 2) + '\n');
+  const tmp = CONFIG_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(normalized, null, 2) + '\n');
+  fs.renameSync(tmp, CONFIG_PATH);
   return normalized;
 }
 
@@ -100,17 +187,45 @@ function appendLog(record) {
   }
 }
 
+/** A replay is a tiny request; anything slower than this is hung, and must not hold the lock. */
+const REPLAY_TIMEOUT_MS = 60_000;
+/** `workspace/session-activity` kinds that postpone a compaction. `turn` is covered by agent.status; `schedule` (a task due later) must not block it. */
+const BLOCKING_KINDS = new Set(['job', 'subagent']);
+/** Share of the replayed prompt that must come from cache to count as a hit. */
+const HIT_RATIO = 0.9;
+
+/** Fields the HTTP endpoint may change; routes, prices and per-window maps stay file-only (or have their own endpoint). */
+const CONFIG_PATCH_KEYS = ['enabled', 'compactEnabled', 'compactResetOnManual', 'compactSkipWhenBusy', 'compactMinTokens', 'compactAfterMinutes', 'intervalMinutes', 'maxIdleMinutes', 'replayMaxTokens', 'scanSeconds', 'maxSessions'];
+/** Max number of per-model override entries kept. */
+const ROUTE_SETTINGS_MAX = 50;
+
 export const name = 'cache-keepalive';
 export const inject = ['llm', 'sessions'];
 
 export function apply(ctx) {
-  let cfg = loadConfig();
+  let cfg = loadConfig() ?? normalizeConfig(DEFAULTS);
   /** sessionId -> { snapshot, lastRealAt, touches, nextDueAt, stopped } */
   const sessions = new Map();
   /** replay option objects created by this plugin: never captured, never observed. */
   const replaying = new WeakSet();
   /** sessionIds with a real model stream in flight. */
-  const inflight = new Set();
+  /**
+   * Real streams in flight, per session AND route. A stream on a different route (a persona rewrite, a
+   * title call...) does not touch the replayed prefix's cache, so it must not hold the replay back.
+   */
+  const inflightCounts = new Map();
+  const inflight = {
+    add(id, route = '') { const k = id + '|' + route; inflightCounts.set(k, (inflightCounts.get(k) ?? 0) + 1); },
+    delete(id, route = '') { const k = id + '|' + route; const n = (inflightCounts.get(k) ?? 0) - 1; if (n > 0) inflightCounts.set(k, n); else inflightCounts.delete(k); },
+    /** `route` omitted: any route of this session. */
+    has(id, route) {
+      if (route !== undefined) return (inflightCounts.get(id + '|' + route) ?? 0) > 0;
+      for (const [k, n] of inflightCounts) if (n > 0 && k.startsWith(id + '|')) return true;
+      return false;
+    }
+  };
+  /** Sessions with a compaction running (compaction runs outside the global replay lock). */
+  const compacting = new Set();
   let busy = false;
 
   // ---- status surface (settings page card) ----
@@ -133,14 +248,28 @@ export function apply(ctx) {
   /** Browser-side diagnostics reported by client.js (bundle load, slot registration errors). */
   const clientDiagnostics = [];
   /**
-   * CNY per 1M tokens, kimi-k3.1-pro list price (official domestic price page):
-   * input ¥13, hit ¥1.3, output ¥68, cache write (5m TTL) ¥13. Only used for
-   * the estimate labels.
+   * CNY per 1M tokens, keyed "provider/model". Estimate labels only, not a bill.
+   * kimi: official domestic list price. blsc-anthropic: AI 智算云 market price
+   * (hit = 0.1 x input); its cache-write price is not published, so write is
+   * assumed to be Anthropic's standard 1.25 x input. Override via config.prices.
+   * A route with no entry here is costed at 0 and reports no savings.
    */
-  const PRICE = { hit: 1.3, input: 13, output: 68, write: 13 };
-
+  const DEFAULT_PRICES = {
+    // miss: 'input+write' = this vendor bills an expired prefix at the input price AND a cache write (kimi's official billing).
+    // The default (omitted) is Anthropic-style: an expired prefix is billed once, at the cache-write price.
+    'kimi-coding/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13, miss: 'input+write' },
+    'huosan/kimi-k3.1-pro': { hit: 1.3, input: 13, output: 68, write: 13, miss: 'input+write' },
+    'blsc-anthropic/Claude-Sonnet-5.5': { hit: 0.1944, input: 1.9444, output: 9.7222, write: 2.4306 },
+    'blsc-anthropic/Claude-Opus-5.5': { hit: 0.3889, input: 3.8889, output: 19.4444, write: 4.8611 }
+  };
+  const NO_PRICE = { hit: 0, input: 0, output: 0, write: 0 };
+  function priceFor(provider, model) {
+    const key = routeKeyOf(provider, model);
+    return cfg.prices[key] ?? DEFAULT_PRICES[key] ?? NO_PRICE;
+  }
   function priceOf(record) {
-    return ((record.cacheRead ?? 0) * PRICE.hit + (record.input ?? 0) * PRICE.input + (record.output ?? 0) * PRICE.output) / 1e6;
+    const price = priceFor(record.provider, record.model);
+    return ((record.cacheRead ?? 0) * price.hit + (record.cacheWrite ?? 0) * price.write + (record.input ?? 0) * price.input + (record.output ?? 0) * price.output) / 1e6;
   }
   function remember(record) {
     history.push(record);
@@ -199,10 +328,26 @@ export function apply(ctx) {
   function routeKeyOf(provider, model) {
     return String(provider) + '/' + String(model);
   }
+  /**
+   * The value of a per-model setting for one route: its own override, else (interval only) the built-in
+   * routeIntervals preset, else the global setting. No route (a window with no snapshot yet) = global.
+   */
+  function routeParam(provider, model, field) {
+    if (provider === undefined || model === undefined) return cfg[field];
+    const key = routeKeyOf(provider, model);
+    const own = cfg.routeSettings?.[key]?.[field];
+    if (typeof own === 'number') return own;
+    if (field === 'intervalMinutes') {
+      const preset = Number(cfg.routeIntervals?.[key]);
+      if (Number.isFinite(preset) && preset > 0) return preset;
+    }
+    return cfg[field];
+  }
+  function entryParam(entry, field) {
+    return routeParam(entry?.snapshot?.provider, entry?.snapshot?.model, field);
+  }
   function intervalFor(provider, model) {
-    const overrides = cfg.routeIntervals && typeof cfg.routeIntervals === 'object' ? cfg.routeIntervals : {};
-    const minutes = Number(overrides[routeKeyOf(provider, model)]);
-    return (Number.isFinite(minutes) && minutes > 0 ? minutes : cfg.intervalMinutes) * 60_000;
+    return routeParam(provider, model, 'intervalMinutes') * 60_000;
   }
   /** "provider/model" -> { provider, model, proven, lastCacheRead, samples } */
   const routeStats = new Map();
@@ -214,6 +359,21 @@ export function apply(ctx) {
       routeStats.set(key, state);
     }
     return state;
+  }
+
+  /** `agents` / `commands` are only needed for compaction: fetched lazily so the keep-alive part works without them. */
+  function optionalService(name) {
+    try {
+      const service = ctx.get(name);
+      if (service !== undefined && service !== null) return service;
+    } catch {
+      /* not mounted */
+    }
+    try {
+      return ctx[name];
+    } catch {
+      return undefined;
+    }
   }
 
   function sessionsService() {
@@ -284,10 +444,16 @@ export function apply(ctx) {
     }
   }
 
-  function routeAllowed(provider, model) {
+  /** Is this model in config.routes (an empty list lists every model)? */
+  function routeListed(provider, model) {
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (routes.length === 0) return true;
     return routes.some((route) => route.provider === provider && route.model === model);
+  }
+  /** The per-model switch wins over config.routes in both directions. */
+  function routeAllowed(provider, model) {
+    const choice = cfg.routeSettings?.[routeKeyOf(provider, model)]?.enabled;
+    return typeof choice === 'boolean' ? choice : routeListed(provider, model);
   }
 
   /** Per-window switch: explicit session choice wins over the config default. */
@@ -296,17 +462,44 @@ export function apply(ctx) {
     if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
     return cfg.enabled === true;
   }
+  /**
+   * Insert/overwrite a switch at the tail. Past 300 entries drop the ones that merely repeat the
+   * default first (they change nothing), oldest first; only then the oldest remaining entry.
+   */
+  function withSwitch(source, sessionId, value, defaultValue) {
+    const map = { ...(source && typeof source === 'object' ? source : {}) };
+    delete map[sessionId];
+    map[sessionId] = value === true;
+    if (Object.keys(map).length > 300) {
+      for (const key of Object.keys(map)) {
+        if (Object.keys(map).length <= 300) break;
+        if (key !== sessionId && map[key] === (defaultValue === true)) delete map[key];
+      }
+      for (const key of Object.keys(map)) {
+        if (Object.keys(map).length <= 300) break;
+        if (key !== sessionId) delete map[key];
+      }
+    }
+    return map;
+  }
   function setSessionEnabledOf(sessionId, enabled) {
-    const map = { ...(cfg.sessionEnabled && typeof cfg.sessionEnabled === 'object' ? cfg.sessionEnabled : {}) };
-    map[sessionId] = enabled === true;
-    const keys = Object.keys(map);
-    for (const stale of keys.slice(0, Math.max(0, keys.length - 300))) delete map[stale];
-    cfg = saveConfig({ ...cfg, sessionEnabled: map });
+    cfg = saveConfig({ ...cfg, sessionEnabled: withSwitch(cfg.sessionEnabled, sessionId, enabled, cfg.enabled) });
     // Turning a window on starts a fresh "本次开启" epoch; turning it off drops it.
     if (enabled === true) enabledSince.set(sessionId, Date.now());
     else enabledSince.delete(sessionId);
     if (enabled !== true) sessions.delete(sessionId);
     appendLog({ kind: 'session-switch', session: sessionId, enabled: enabled === true });
+  }
+
+  /** Per-window compaction switch: explicit window choice wins over the config default. */
+  function compactEnabledOf(sessionId) {
+    const map = cfg.sessionCompact && typeof cfg.sessionCompact === 'object' ? cfg.sessionCompact : {};
+    if (Object.prototype.hasOwnProperty.call(map, sessionId)) return map[sessionId] === true;
+    return cfg.compactEnabled === true;
+  }
+  function setSessionCompactOf(sessionId, enabled) {
+    cfg = saveConfig({ ...cfg, sessionCompact: withSwitch(cfg.sessionCompact, sessionId, enabled, cfg.compactEnabled) });
+    appendLog({ kind: 'compact-switch', session: sessionId, enabled: enabled === true });
   }
 
   function prune() {
@@ -316,15 +509,14 @@ export function apply(ctx) {
   }
 
   /**
-   * Net saving of one idle gap. A cold re-prefill costs C tokens at the input
-   * price PLUS a C-token 5m cache write (official billing counts both), i.e.
-   * (input + write) per token; keeping the cache warm costs `touches` cache
-   * reads at the hit price. So net = C * hit * (R - touches), R = (input+write)/hit
-   * = 20 for kimi-k3.1-pro. A gap whose only outcomes were misses/errors saved
-   * nothing and cost cash.
+   * Net saving of one idle gap that ended in a real request. Had the cache expired, the
+   * next request would have paid `coldPerM` (Anthropic-style: one cache write; kimi:
+   * input + write) instead of the live-cache read `hit`, i.e. it avoids C * (cold - hit).
+   * Keeping the cache warm cost the replays themselves (reads + their tiny output), summed
+   * in gap.cost. net = C * (cold - hit) - gap.cost. A gap whose only outcomes were
+   * misses/errors saved nothing and cost cash.
    */
-  const PRICE_RATIO = (PRICE.input + PRICE.write) / PRICE.hit;
-  function summarizeSession(records) {
+  function summarizeSession(records, lastGapOpen = false) {
     const summary = { touches: 0, hits: 0, misses: 0, errors: 0, unknown: 0, cacheRead: 0, input: 0, output: 0, cost: 0, saved: 0 };
     const gaps = [];
     let previousTouch = 0;
@@ -343,7 +535,7 @@ export function apply(ctx) {
       let gap = gaps[gaps.length - 1];
       // `touch` restarts at 1 whenever a real request re-captures the session.
       if (gap === undefined || touch <= previousTouch) {
-        gap = { touches: 0, cache: 0, hit: false, cost: 0 };
+        gap = { touches: 0, cache: 0, hit: false, cost: 0, provider: record.provider, model: record.model };
         gaps.push(gap);
       }
       previousTouch = touch;
@@ -354,14 +546,31 @@ export function apply(ctx) {
         gap.hit = true;
       }
     }
-    for (const gap of gaps) {
+    for (const [gapIndex, gap] of gaps.entries()) {
+      // A gap that has not ended in a real request yet saved nothing so far: it only counts what it cost.
+      if (lastGapOpen && gapIndex === gaps.length - 1) {
+        summary.saved -= gap.cost;
+        continue;
+      }
+      const price = priceFor(gap.provider, gap.model);
+      // What the NEXT real request would have cost, per 1M tokens, had the cache expired, minus what it costs on a live cache.
+      const coldPerM = price.miss === 'input+write' ? price.input + price.write : price.write;
+      const avoidedPerM = Math.max(0, coldPerM - price.hit);
       summary.saved += gap.hit
-        ? (gap.cache * Math.max(0, PRICE_RATIO - gap.touches) * PRICE.hit) / 1e6
+        ? (gap.cache * avoidedPerM) / 1e6 - gap.cost
         : -gap.cost;
     }
     summary.cost = +summary.cost.toFixed(6);
     summary.saved = +summary.saved.toFixed(6);
     return summary;
+  }
+
+  /** True while the session's newest idle gap has no real request after it (the user has not come back yet). */
+  function lastGapOpenOf(sessionId, records) {
+    const entry = sessions.get(sessionId);
+    const last = records[records.length - 1];
+    if (entry === undefined || last === undefined) return false;
+    return entry.lastRealAt < Date.parse(last.ts);
   }
 
   /**
@@ -416,10 +625,13 @@ export function apply(ctx) {
       const entry = sessions.get(sessionId);
       windows[sessionId] = {
         enabled,
+        compact: compactEnabledOf(sessionId),
         since: since === null ? null : since,
-        ...summarizeSession(kept),
+        ...summarizeSession(kept, lastGapOpenOf(sessionId, kept)),
         lastAt: kept.length > 0 ? kept[kept.length - 1].ts : null,
         gapTouches: entry === undefined ? 0 : entry.touches,
+        ...routeLimits(sessionId, entry),
+        ...compactionInfo(sessionId, entry),
         stopped: entry === undefined ? false : entry.stopped,
         idleMinutes: entry === undefined ? null : +((Date.now() - entry.lastRealAt) / 60000).toFixed(1),
         nextDueSeconds: entry === undefined ? null : Math.max(0, Math.round((entry.nextDueAt - Date.now()) / 1000))
@@ -455,7 +667,7 @@ export function apply(ctx) {
         model: latest?.model ?? null,
         firstAt: records[0]?.ts ?? null,
         lastAt: latest?.ts ?? null,
-        ...summarizeSession(records)
+        ...summarizeSession(records, lastGapOpenOf(sessionId, records))
       });
     }
     tasks.sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
@@ -479,7 +691,7 @@ export function apply(ctx) {
       }));
   }
 
-  /** Forget one task: drop its keepalive lines from disk and stop its current idle gap. */
+  /** Forget one task: drop its keepalive lines from disk (switch/capture lines stay, they carry the "本次开启" start) and stop its current idle gap. */
   function deleteTask(sessionId) {
     try {
       let kept = [];
@@ -489,7 +701,7 @@ export function apply(ctx) {
           if (line.trim().length === 0) return false;
           try {
             const record = JSON.parse(line);
-            return !(record !== null && typeof record === 'object' && record.session === sessionId);
+            return !(record !== null && typeof record === 'object' && record.session === sessionId && record.kind === 'keepalive');
           } catch {
             return true;
           }
@@ -536,6 +748,8 @@ export function apply(ctx) {
         touches: 0,
         nextDueAt: now + intervalFor(options.provider, options.model),
         stopped: false,
+        gen: 0,
+        lastTouchAt: now,
         title
       });
       appendLog({ kind: 'capture', session: sessionId, title, provider: options.provider, model: options.model, messages: Array.isArray(options.messages) ? options.messages.length : null, toolHistory: Array.isArray(options.toolHistory) ? options.toolHistory.length : null, tools: Array.isArray(options.tools) ? options.tools.length : null });
@@ -545,14 +759,21 @@ export function apply(ctx) {
       existing.touches = 0;
       existing.nextDueAt = now + intervalFor(options.provider, options.model);
       existing.stopped = false;
+      existing.gen = (existing.gen ?? 0) + 1;
+      existing.deferLogged = false;
+      existing.blockLogged = false;
+      existing.compactBlocked = undefined;
+      existing.lastTouchAt = now;
       if (title !== null && title.length > 0) existing.title = title;
     }
     prune();
   }
 
-  function observe(iterable, sessionId) {
-    inflight.add(sessionId);
+  function observe(iterable, sessionId, route) {
     return (async function* observeStream() {
+      // Marked in-flight only once iteration starts, so a stream that is closed
+      // before its first pull can never leave the session stuck as in-flight.
+      inflight.add(sessionId, route);
       try {
         for await (const chunk of iterable) {
           try {
@@ -564,6 +785,9 @@ export function apply(ctx) {
                 const cacheRead = chunk.usage.cacheReadTokens ?? chunk.usage.cacheRead ?? 0;
                 const uncached = chunk.usage.inputTokens ?? chunk.usage.input ?? 0;
                 route.lastCacheRead = cacheRead;
+                const entry = sessions.get(sessionId);
+                const cacheWriteNow = chunk.usage.cacheWriteTokens ?? chunk.usage.cacheWrite ?? 0;
+                if (entry !== undefined && cacheRead + uncached + cacheWriteNow > 0) entry.contextTokens = cacheRead + uncached + cacheWriteNow;
                 const total = cacheRead + uncached;
                 if (cacheRead >= 1024 && total > 0 && cacheRead / total >= 0.2) route.proven = true;
               }
@@ -574,16 +798,132 @@ export function apply(ctx) {
           yield chunk;
         }
       } finally {
-        inflight.delete(sessionId);
+        inflight.delete(sessionId, route);
       }
     })();
   }
 
-  function buildReplayOptions(snapshot) {
+  function buildReplayOptions(snapshot, signal) {
     const { signal: _ignored, ...rest } = snapshot;
-    const options = { ...rest, maxTokens: cfg.replayMaxTokens };
+    const options = { ...rest, maxTokens: cfg.replayMaxTokens, signal };
     replaying.add(options);
     return options;
+  }
+
+  /** Run the official compaction once. Mirrors dsh-auto-compact's channel order: scoped service first, `/compact` command second. */
+  async function runCompaction(agent, signal) {
+    let compaction;
+    try {
+      compaction = agent?.ctx?.get?.('compaction');
+    } catch {
+      compaction = undefined;
+    }
+    if (compaction !== undefined && compaction !== null && typeof compaction.compactNow === 'function') {
+      const result = await compaction.compactNow(agent, signal);
+      if (result === null) return { via: 'service', kind: 'noop', text: 'nothing to compact' };
+      const tokens = typeof result.shadowedTokenCount === 'number' ? result.shadowedTokenCount : 0;
+      return { via: 'service', kind: 'success', text: 'compacted ~' + tokens + ' tokens' };
+    }
+    const commands = optionalService('commands');
+    if (commands === undefined || typeof commands.execute !== 'function') return { via: 'command', kind: 'missing', text: 'no command service' };
+    const execution = await commands.execute(agent, '/compact', [], signal);
+    if (execution === undefined) return { via: 'command', kind: 'missing', text: 'no /compact command in this session' };
+    const result = execution.result ?? {};
+    return { via: 'command', kind: result.kind ?? 'unknown', text: result.text ?? '' };
+  }
+
+  /** Reject when `signal` aborts, so a call that ignores its signal still cannot hold a lock forever. */
+  function abortRace(signal, message) {
+    return new Promise((_, reject) => {
+      if (signal.aborted) reject(new Error(message));
+      else signal.addEventListener('abort', () => reject(new Error(message)), { once: true });
+    });
+  }
+
+  /**
+   * Is a background job or a subagent that belongs to this window still running? The agent is idle in that case
+   * (it ended its turn and waits for the completion notice), so `agent.status` alone cannot tell. DSH answers this
+   * through the `workspace/session-activity` waterfall (the same question it asks before archiving a session).
+   * No such event (older DSH) = nothing to check; a failed check postpones the compaction to the next scan.
+   * Records why in `entry.compactBlocked` (shown on the compaction hover card) and logs once per idle gap.
+   */
+  async function hasRunningWork(sessionId, entry) {
+    if (typeof ctx.waterfall !== 'function') return false;
+    let activity;
+    try {
+      activity = await ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]));
+    } catch (error) {
+      entry.compactBlocked = { at: Date.now(), kinds: ['unknown'] };
+      if (entry.blockLogged !== true) {
+        entry.blockLogged = true;
+        appendLog({ kind: 'compact', session: sessionId, status: 'postponed', reason: 'activity-check-failed', error: String(error?.message ?? error) });
+      }
+      return true;
+    }
+    const kinds = (Array.isArray(activity) ? activity : []).map((a) => String(a?.kind)).filter((k) => BLOCKING_KINDS.has(k));
+    if (kinds.length === 0) {
+      entry.compactBlocked = undefined;
+      return false;
+    }
+    entry.compactBlocked = { at: Date.now(), kinds };
+    if (entry.blockLogged !== true) {
+      entry.blockLogged = true;
+      appendLog({ kind: 'compact', session: sessionId, status: 'postponed', reason: 'running-work', running: kinds });
+    }
+    return true;
+  }
+
+  /**
+   * Idle long enough: compact once through the official backend, then stop keeping
+   * this session alive. The entry is marked stopped BEFORE the call, so a failure or
+   * a no-op can never retrigger; the next real request re-captures and re-arms it.
+   * Returns false (nothing started, keep-alive carries on) while the agent is not
+   * idle or a model stream is in flight. Runs outside the global replay lock, so a
+   * slow compaction never delays other sessions' keep-alive.
+   */
+  /** A context below compactMinTokens is not worth compacting (unknown size = allowed, as before). */
+  function compactWorthy(entry) {
+    const minTokens = entryParam(entry, 'compactMinTokens');
+    return minTokens <= 0 || typeof entry?.contextTokens !== 'number' || entry.contextTokens >= minTokens;
+  }
+
+  async function startCompaction(sessionId, entry) {
+    const agent = optionalService('agents')?.get?.(sessionId);
+    if (agent === undefined) {
+      entry.stopped = true;
+      appendLog({ kind: 'compact', session: sessionId, status: 'skipped', reason: 'no-agent' });
+      return true;
+    }
+    if (agent.status !== 'idle' || inflight.has(sessionId) || compacting.has(sessionId)) return false;
+    const realAt = entry.lastRealAt;
+    if (cfg.compactSkipWhenBusy && (await hasRunningWork(sessionId, entry))) return false;
+    // The check above yielded: a real request or a new turn may have arrived meanwhile.
+    if (entry.lastRealAt !== realAt || agent.status !== 'idle' || inflight.has(sessionId) || compacting.has(sessionId) || entry.stopped) return false;
+    entry.compactBlocked = undefined;
+    compacting.add(sessionId);
+    entry.stopped = true;
+    const idleMinutes = +((Date.now() - entry.lastRealAt) / 60000).toFixed(1);
+    const signal = AbortSignal.timeout(10 * 60_000);
+    void (async () => {
+      try {
+        const result = await Promise.race([runCompaction(agent, signal), abortRace(signal, 'compaction timed out')]);
+        entry.lastCompaction = { at: Date.now(), kind: 'auto', status: result.kind };
+        appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: result.kind, via: result.via, text: result.text, idleMinutes, touches: entry.touches });
+      } catch (error) {
+        entry.lastCompaction = { at: Date.now(), kind: 'auto', status: 'error' };
+        appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'error', error: String(error?.message ?? error), idleMinutes, touches: entry.touches });
+      } finally {
+        compacting.delete(sessionId);
+      }
+    })();
+    return true;
+  }
+
+  /** Why a due replay did not run: logged once per idle gap, and only when it is already 30 s overdue. */
+  function noteDeferred(sessionId, entry, reason, now) {
+    if (entry.deferLogged === true || now < entry.nextDueAt + 30_000) return;
+    entry.deferLogged = true;
+    appendLog({ kind: 'defer', session: sessionId, reason, overdueSeconds: Math.round((now - entry.nextDueAt) / 1000) });
   }
 
   async function replay(sessionId, entry) {
@@ -592,22 +932,47 @@ export function apply(ctx) {
       sessions.delete(sessionId);
       return;
     }
-    if (busy) return;
-    if (entry.stopped) return;
-    if (entry.touches >= cfg.maxTouches) {
-      entry.stopped = true;
-      appendLog({ kind: 'stop', session: sessionId, reason: 'max-touches', touches: entry.touches });
+    if (busy) {
+      noteDeferred(sessionId, entry, 'another-replay-running', Date.now());
       return;
     }
+    if (entry.stopped) return;
+    if (entry.snapshot !== undefined && !routeAllowed(entry.snapshot.provider, entry.snapshot.model)) {
+      // This model was switched off in the settings while the window was armed.
+      entry.stopped = true;
+      appendLog({ kind: 'stop', session: sessionId, reason: 'route-off' });
+      return;
+    }
+    const compactOn = compactEnabledOf(sessionId) && compactWorthy(entry);
+    const compactAfterMinutes = entryParam(entry, 'compactAfterMinutes');
+    const maxIdleMinutes = entryParam(entry, 'maxIdleMinutes');
+    // The cache is refreshed from the START of the last request. If we are already well past the replay
+    // interval (machine slept, clock jumped, queue backed up) it has probably expired, and a replay or a
+    // compaction (which reads the whole context) would only pay for a cold rewrite. Stop instead.
+    const nowMs = Date.now();
+    if (entry.snapshot !== undefined && !inflight.has(sessionId, routeKeyOf(entry.snapshot.provider, entry.snapshot.model))) {
+      const sinceTouch = nowMs - (entry.lastTouchAt ?? entry.lastRealAt);
+      if (sinceTouch > intervalFor(entry.snapshot.provider, entry.snapshot.model) * 1.25) {
+        entry.stopped = true;
+        appendLog({ kind: 'stop', session: sessionId, reason: 'stale', sinceTouchMinutes: +(sinceTouch / 60000).toFixed(1) });
+        return;
+      }
+    }
+    if (compactOn && Date.now() - entry.lastRealAt >= compactAfterMinutes * 60_000 && (await startCompaction(sessionId, entry))) return;
     const now = Date.now();
-    if (now - entry.lastRealAt > cfg.maxIdleMinutes * 60_000) {
+    // With compaction on, the idle cap must leave room for the compaction to happen first.
+    const idleCapMinutes = compactOn ? Math.max(maxIdleMinutes, compactAfterMinutes + 1) : maxIdleMinutes;
+    if (now - entry.lastRealAt > idleCapMinutes * 60_000) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'max-idle', idleMinutes: +((now - entry.lastRealAt) / 60000).toFixed(1) });
       return;
     }
-    if (now < entry.nextDueAt) return;
-    if (inflight.has(sessionId)) return;
+    if (now + cfg.scanSeconds * 1000 < entry.nextDueAt) return;
     if (entry.snapshot === undefined) return;
+    if (inflight.has(sessionId, routeKeyOf(entry.snapshot.provider, entry.snapshot.model))) {
+      noteDeferred(sessionId, entry, 'stream-in-flight', now);
+      return;
+    }
     if (cfg.requireProvenCache !== false && !routeState(entry.snapshot.provider, entry.snapshot.model).proven) {
       // No real request on this route has shown a cache hit yet: don't spend on it.
       return;
@@ -615,44 +980,67 @@ export function apply(ctx) {
 
     busy = true;
     entry.touches += 1;
-    entry.nextDueAt = now + intervalFor(entry.snapshot.provider, entry.snapshot.model);
+    const touch = entry.touches;
+    const gen = entry.gen ?? 0;
+    const snapshot = entry.snapshot;
+    entry.lastTouchAt = now;
+    entry.nextDueAt = now + intervalFor(snapshot.provider, snapshot.model);
     const title = sessionTitle(sessionId) ?? entry.title ?? storedTitles.get(sessionId) ?? null;
     if (title !== null) entry.title = title;
     const startedAt = Date.now();
     let usage = null;
     let finishReason = null;
+    const abort = new AbortController();
+    const watchdog = setTimeout(() => abort.abort(), REPLAY_TIMEOUT_MS);
     try {
-      const options = buildReplayOptions(entry.snapshot);
-      for await (const chunk of ctx.llm.stream(options)) {
-        if (chunk === null || typeof chunk !== 'object') continue;
-        if (chunk.type === 'usage') usage = chunk.usage ?? usage;
-        else if (chunk.type === 'finish') finishReason = chunk.reason ?? finishReason;
-      }
+      const options = buildReplayOptions(snapshot, abort.signal);
+      const consume = async () => {
+        for await (const chunk of ctx.llm.stream(options)) {
+          if (chunk === null || typeof chunk !== 'object') continue;
+          if (chunk.type === 'usage') usage = chunk.usage ?? usage;
+          else if (chunk.type === 'finish') finishReason = chunk.reason ?? finishReason;
+        }
+      };
+      await Promise.race([consume(), abortRace(abort.signal, 'replay timed out')]);
     } catch (error) {
       busy = false;
-      entry.stopped = true;
-      appendLog({ kind: 'keepalive', session: sessionId, title, provider: entry.snapshot.provider, model: entry.snapshot.model, touch: entry.touches, status: 'error', error: String(error?.message ?? error) });
+      if ((entry.gen ?? 0) === gen) entry.stopped = true;
+      const errorRecord = { ts: new Date().toISOString(), kind: 'keepalive', session: sessionId, title, provider: snapshot.provider, model: snapshot.model, touch, status: 'error', error: String(error?.message ?? error) };
+      appendLog(errorRecord);
+      remember(errorRecord);
+      addToStats(errorRecord);
       return;
+    } finally {
+      clearTimeout(watchdog);
     }
     busy = false;
 
     const cacheRead = usage?.cacheReadTokens ?? usage?.cacheRead ?? null;
     const input = usage?.inputTokens ?? usage?.input ?? null;
     const output = usage?.outputTokens ?? usage?.output ?? null;
+    const cacheWrite = usage?.cacheWriteTokens ?? usage?.cacheWrite ?? 0;
     const failed = finishReason !== null && typeof finishReason === 'object' && finishReason.kind === 'error';
-    const status = failed ? 'error' : cacheRead === null ? 'unknown' : cacheRead > 0 ? 'hit' : 'miss';
+    // A genuine hit reads (nearly) the whole prompt from cache. A small read next to a large
+    // uncached/rewritten remainder means the replay diverged from the real request: that is a
+    // miss, and repeating it would rewrite the prefix every interval.
+    const promptTokens = (cacheRead ?? 0) + (input ?? 0) + cacheWrite;
+    // The adapter omits a zero cacheRead entirely, so "no cache field but a prompt was billed" is a miss, not "unknown".
+    const status = failed ? 'error'
+      : cacheRead === null ? ((input ?? 0) + cacheWrite > 0 ? 'miss' : 'unknown')
+        : cacheRead > 0 && promptTokens > 0 && cacheRead / promptTokens >= HIT_RATIO ? 'hit' : 'miss';
     const record = {
       ts: new Date().toISOString(),
       kind: 'keepalive',
       session: sessionId,
       title,
-      provider: entry.snapshot.provider,
-      model: entry.snapshot.model,
-      touch: entry.touches,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      touch,
       status,
       cacheRead,
       input,
       output,
+      ...(cacheWrite > 0 ? { cacheWrite } : {}),
       finish: finishReason,
       ms: Date.now() - startedAt
     };
@@ -660,27 +1048,39 @@ export function apply(ctx) {
     remember(record);
     if (title !== null) storedTitles.set(sessionId, title);
     addToStats(record);
+    // A real request arrived while this replay was in flight: it re-armed the entry, so this
+    // (now stale) result is recorded but must not stop the new idle gap.
+    if ((entry.gen ?? 0) !== gen) return;
+    if (!failed && promptTokens > 0) entry.contextTokens = promptTokens;
     if (failed) {
       entry.stopped = true;
       appendLog({ kind: 'stop', session: sessionId, reason: 'replay-error' });
-    } else if (cacheRead === 0) {
+    } else if (status === 'miss' || status === 'unknown') {
       entry.stopped = true;
-      appendLog({ kind: 'stop', session: sessionId, reason: 'cache-miss' });
+      appendLog({ kind: 'stop', session: sessionId, reason: status === 'miss' ? 'cache-miss' : 'cache-unknown' });
     }
   }
 
-  function tick() {
-    if (sessions.size === 0) return;
-    const entries = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt).slice(0, cfg.maxSessions);
-    for (const [sessionId, entry] of entries) {
-      if (!sessionEnabledOf(sessionId)) {
-        sessions.delete(sessionId);
-        continue;
+  let ticking = false;
+  /** Sequential: every due session is handled in the same pass (back to back), so a later session is not pushed a whole scan interval past its TTL. */
+  async function tick() {
+    if (ticking || sessions.size === 0) return;
+    ticking = true;
+    try {
+      const entries = [...sessions.entries()].sort((a, b) => b[1].lastRealAt - a[1].lastRealAt).slice(0, cfg.maxSessions);
+      for (const [sessionId, entry] of entries) {
+        if (!sessionEnabledOf(sessionId)) {
+          sessions.delete(sessionId);
+          continue;
+        }
+        try {
+          await replay(sessionId, entry);
+        } catch (error) {
+          ctx.logger?.warn?.('cache-keepalive: replay failed: ' + String(error?.message ?? error));
+        }
       }
-      void replay(sessionId, entry).catch((error) => {
-        ctx.logger?.warn?.('cache-keepalive: replay failed: ' + String(error?.message ?? error));
-      });
-      if (busy) return;
+    } finally {
+      ticking = false;
     }
   }
 
@@ -694,8 +1094,124 @@ export function apply(ctx) {
     const sessionId = options?.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return raw;
     if (replaying.has(options)) return raw;
-    return observe(raw, sessionId);
+    // Requests that carry a purpose (compaction, titles...) are not real turns: don't track them as in-flight or learn cache proof from them.
+    if (options.purpose !== undefined) return raw;
+    return observe(raw, sessionId, routeKeyOf(options.provider, options.model));
   });
+
+  /**
+   * The user's own /compact (a `compaction/end` with no turn and no error) rewrites the session surface: the
+   * stored request snapshot no longer describes what the next real request will send, so replaying it would
+   * only keep an obsolete prefix warm. With `compactResetOnManual` the window's auto-compaction countdown is
+   * cleared along with it; the next real request re-arms keep-alive and starts the countdown again.
+   */
+  ctx.on('session/event', (session, event) => {
+    try {
+      if (event?.type !== 'compaction/end' || event.data?.error !== undefined || event.data?.turn !== null) return;
+      const sessionId = session?.id;
+      if (typeof sessionId !== 'string' || compacting.has(sessionId)) return;
+      const entry = sessions.get(sessionId);
+      if (entry === undefined) return;
+      entry.lastCompaction = { at: Date.now(), kind: 'manual', status: 'success' };
+      if (!cfg.compactResetOnManual) return;
+      entry.stopped = true;
+      entry.snapshot = undefined;
+      appendLog({ kind: 'compact', session: sessionId, title: entry.title ?? null, status: 'manual', via: 'user', text: 'manual compaction: countdown cleared, waiting for the next real request' });
+    } catch (error) {
+      ctx.logger?.warn?.('cache-keepalive: compaction event handler failed: ' + String(error?.message ?? error));
+    }
+  });
+
+  /** What the compaction half of the composer oval shows: a countdown while armed, otherwise why there is none. */
+  function compactionInfo(sessionId, entry) {
+    const on = compactEnabledOf(sessionId);
+    const minutes = entryParam(entry, 'compactAfterMinutes');
+    const last = entry?.lastCompaction ?? null;
+    let status;
+    let dueSeconds = null;
+    if (!on) status = 'off';
+    else if (entry === undefined) status = 'waiting';
+    else if (compacting.has(sessionId)) status = 'running';
+    else if (last !== null && entry.stopped && entry.lastRealAt <= last.at) status = last.kind === 'manual' ? 'manual' : 'done';
+    else if (entry.stopped) status = 'stopped';
+    else if (!compactWorthy(entry)) status = 'small';
+    else if (entry.compactBlocked !== undefined && Date.now() - entry.lastRealAt >= minutes * 60_000) status = 'blocked';
+    else {
+      status = 'counting';
+      dueSeconds = Math.max(0, Math.round((entry.lastRealAt + minutes * 60_000 - Date.now()) / 1000));
+    }
+    return { compactStatus: status, compactDueSeconds: dueSeconds, compactAfterMinutes: minutes, compactBlockedBy: status === 'blocked' ? entry.compactBlocked.kinds : null, compactMinTokens: entryParam(entry, 'compactMinTokens'), contextTokens: typeof entry?.contextTokens === 'number' ? entry.contextTokens : null, lastCompaction: last };
+  }
+
+  /** Interval and keep-alive count that actually apply to this window's route (they differ per route). */
+  function routeLimits(sessionId, entry) {
+    const snapshot = entry?.snapshot;
+    const intervalMs = snapshot === undefined ? cfg.intervalMinutes * 60_000 : intervalFor(snapshot.provider, snapshot.model);
+    const maxIdle = entryParam(entry, 'maxIdleMinutes');
+    const idleCap = compactEnabledOf(sessionId) && compactWorthy(entry) ? Math.max(maxIdle, entryParam(entry, 'compactAfterMinutes') + 1) : maxIdle;
+    return { intervalMinutes: +(intervalMs / 60000).toFixed(1), maxTouches: Math.floor((idleCap * 60_000) / intervalMs) };
+  }
+
+  /** "provider/model" -> { provider, model }; the provider id never contains "/", the model id may. */
+  function splitRouteKey(key) {
+    const at = key.indexOf('/');
+    return { provider: key.slice(0, at), model: key.slice(at + 1) };
+  }
+
+  /** Every model the settings page can show: seen at run time, in the log, in a session, or already configured. */
+  function knownRouteKeys() {
+    const keys = new Set();
+    for (const route of routeStats.values()) keys.add(routeKeyOf(route.provider, route.model));
+    for (const record of history) if (record.provider && record.model) keys.add(routeKeyOf(record.provider, record.model));
+    for (const entry of sessions.values()) if (entry.snapshot) keys.add(routeKeyOf(entry.snapshot.provider, entry.snapshot.model));
+    for (const route of cfg.routes) keys.add(routeKeyOf(route.provider, route.model));
+    for (const key of Object.keys(cfg.routeSettings)) keys.add(key);
+    return [...keys];
+  }
+
+  /** One model's settings card: what it overrides, what applies without the override, what applies now, and where keep-alive stops paying. */
+  function routeInfo(provider, model) {
+    const key = routeKeyOf(provider, model);
+    const own = cfg.routeSettings[key] ?? {};
+    const state = routeStats.get(key);
+    const preset = Number(cfg.routeIntervals[key]);
+    const defaults = {
+      intervalMinutes: Number.isFinite(preset) && preset > 0 ? preset : cfg.intervalMinutes,
+      maxIdleMinutes: cfg.maxIdleMinutes,
+      compactAfterMinutes: cfg.compactAfterMinutes,
+      compactMinTokens: cfg.compactMinTokens
+    };
+    const effective = {};
+    for (const field of Object.keys(defaults)) effective[field] = routeParam(provider, model, field);
+    const price = cfg.prices[key] ?? DEFAULT_PRICES[key];
+    let breakEvenTouches = null;
+    if (price !== undefined && price.hit > 0) {
+      const cold = price.miss === 'input+write' ? price.input + price.write : price.write;
+      if (cold > price.hit) breakEvenTouches = Math.floor((cold - price.hit) / price.hit);
+    }
+    const { enabled: _enabled, ...override } = own;
+    return {
+      provider,
+      model,
+      key,
+      /** Keep-alive applies to this model right now. */
+      enabled: routeAllowed(provider, model),
+      /** In config.routes (or the list is empty): what the switch would be without a per-model choice. */
+      listed: routeListed(provider, model),
+      enabledExplicit: typeof own.enabled === 'boolean',
+      override,
+      defaults,
+      effective,
+      intervalMinutes: effective.intervalMinutes,
+      proven: state?.proven === true,
+      lastCacheRead: state?.lastCacheRead ?? 0,
+      samples: state?.samples ?? 0,
+      priced: price !== undefined,
+      breakEvenTouches,
+      breakEvenMinutes: breakEvenTouches === null ? null : Math.round(breakEvenTouches * effective.intervalMinutes),
+      windows: [...sessions.values()].filter((entry) => entry.snapshot && routeKeyOf(entry.snapshot.provider, entry.snapshot.model) === key).length
+    };
+  }
 
   function stateSnapshot() {
     const tasks = buildTasks();
@@ -710,22 +1226,26 @@ export function apply(ctx) {
         sessionEnabled: cfg.sessionEnabled,
         intervalMinutes: cfg.intervalMinutes,
         maxIdleMinutes: cfg.maxIdleMinutes,
-        maxTouches: cfg.maxTouches,
+        /** Derived, read-only: how many keep-alives fit in the idle cap at the configured interval. */
+        maxTouches: Math.floor(cfg.maxIdleMinutes / cfg.intervalMinutes),
         replayMaxTokens: cfg.replayMaxTokens,
+        compactAfterMinutes: cfg.compactAfterMinutes,
+        compactEnabled: cfg.compactEnabled,
+        compactResetOnManual: cfg.compactResetOnManual,
+        compactSkipWhenBusy: cfg.compactSkipWhenBusy,
+        compactMinTokens: cfg.compactMinTokens,
+        sessionCompact: cfg.sessionCompact,
         scanSeconds: cfg.scanSeconds,
         maxSessions: cfg.maxSessions,
         routes: cfg.routes,
         routeIntervals: cfg.routeIntervals,
+        routeSettings: cfg.routeSettings,
         requireProvenCache: cfg.requireProvenCache
       },
-      routes: [...routeStats.values()].map((route) => ({
-        provider: route.provider,
-        model: route.model,
-        proven: route.proven,
-        lastCacheRead: route.lastCacheRead,
-        samples: route.samples,
-        intervalMinutes: +(intervalFor(route.provider, route.model) / 60000).toFixed(1)
-      })),
+      routes: knownRouteKeys().map((key) => {
+        const { provider, model } = splitRouteKey(key);
+        return routeInfo(provider, model);
+      }),
       sessions: [...sessions.entries()].map(([sessionId, entry]) => ({
         id: sessionId,
         session: String(sessionId).slice(0, 18),
@@ -764,6 +1284,59 @@ export function apply(ctx) {
       res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(body) });
       res.end(body);
     };
+    /**
+     * Browsers let any web page POST a "simple" request (text/plain) to 127.0.0.1 without a
+     * preflight. Require what a cross-site form/no-cors fetch cannot send: a JSON content type
+     * plus our own header (both force a preflight we never answer), and a same-origin Origin.
+     */
+    const header = (req, name) => String(req.headers?.[name] ?? '');
+    /** Host names a DNS-rebinding page cannot own: localhost, IP literals, or this server's own advertised origin. */
+    const hostAllowed = (req, webServer) => {
+      const raw = header(req, 'host');
+      if (raw === '') return false;
+      const name = (raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.replace(/:\d+$/, '')).toLowerCase();
+      if (name === 'localhost' || name.endsWith('.localhost')) return true;
+      if (name.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(name)) return true;
+      try {
+        return new URL(webServer.getOrigin()).host.toLowerCase() === raw.toLowerCase();
+      } catch {
+        return false;
+      }
+    };
+    /** Every route: right Host, and never a cross-site fetch (a browser labels those itself). */
+    const guardRequest = (req, res, webServer) => {
+      if (!hostAllowed(req, webServer)) {
+        send(res, 403, { error: 'host not allowed' });
+        return false;
+      }
+      const site = header(req, 'sec-fetch-site');
+      if (site !== '' && site !== 'same-origin' && site !== 'none') {
+        send(res, 403, { error: 'cross-site request rejected' });
+        return false;
+      }
+      return true;
+    };
+    const guardPost = (req, res) => {
+      const header = (name) => String(req.headers?.[name] ?? '');
+      const origin = header('origin');
+      if (origin !== '') {
+        let originHost = '';
+        try {
+          originHost = new URL(origin).host;
+        } catch {
+          originHost = '';
+        }
+        if (originHost !== header('host')) {
+          send(res, 403, { error: 'cross-origin request rejected' });
+          return false;
+        }
+      }
+      if (!/^application\/json\b/i.test(header('content-type')) || header('x-keepalive') !== '1') {
+        send(res, 415, { error: 'application/json with X-Keepalive: 1 required' });
+        return false;
+      }
+      return true;
+    };
     const readBody = async (req, limit) => {
       let body = '';
       for await (const chunk of req) {
@@ -773,7 +1346,13 @@ export function apply(ctx) {
       return body;
     };
     const installRoutes = (webCtx) => {
-      const webServer = webCtx.webServer;
+      const rawWebServer = webCtx.webServer;
+      const webServer = {
+        register: (route) => rawWebServer.register({
+          ...route,
+          handler: (req, res) => (guardRequest(req, res, rawWebServer) ? route.handler(req, res) : undefined)
+        })
+      };
       webCtx.effect(function* statusRoutes() {
         const offState = webServer.register({
         kind: 'exact',
@@ -794,11 +1373,28 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 16384);
-            const patch = body.length === 0 ? {} : JSON.parse(body);
+            const raw = body.length === 0 ? {} : JSON.parse(body);
+            if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config patch must be an object');
+            const patch = {};
+            for (const key of CONFIG_PATCH_KEYS) if (Object.prototype.hasOwnProperty.call(raw, key)) patch[key] = raw[key];
+            if (raw.routeSettings !== undefined) {
+              // { "provider/model": {fields} | null }: an object replaces that model's overrides, null removes them.
+              if (raw.routeSettings === null || typeof raw.routeSettings !== 'object' || Array.isArray(raw.routeSettings)) throw new Error('routeSettings must be an object');
+              const merged = { ...cfg.routeSettings };
+              for (const [key, value] of Object.entries(raw.routeSettings)) {
+                if (!key.includes('/')) throw new Error('routeSettings keys look like "provider/model"');
+                if (value === null) delete merged[key];
+                else merged[key] = value;
+              }
+              const next = normalizeRouteSettings(merged);
+              if (Object.keys(next).length > ROUTE_SETTINGS_MAX) throw new Error('too many per-model entries (max ' + ROUTE_SETTINGS_MAX + ')');
+              patch.routeSettings = next;
+            }
             cfg = saveConfig({ ...cfg, ...patch });
-            appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
+            appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
             send(res, 200, { ok: true, config: cfg });
           } catch (error) {
             send(res, 400, { error: String(error?.message ?? error) });
@@ -813,6 +1409,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const payload = body.length === 0 ? {} : JSON.parse(body);
@@ -821,12 +1418,19 @@ export function apply(ctx) {
               send(res, 400, { error: 'session required' });
               return;
             }
-            if (typeof payload.enabled !== 'boolean') {
-              send(res, 400, { error: 'enabled must be a boolean' });
+            const hasEnabled = payload.enabled !== undefined;
+            const hasCompact = payload.compact !== undefined;
+            if (!hasEnabled && !hasCompact) {
+              send(res, 400, { error: 'enabled or compact required' });
               return;
             }
-            setSessionEnabledOf(sessionId, payload.enabled);
-            send(res, 200, { ok: true, session: sessionId, enabled: sessionEnabledOf(sessionId) });
+            if ((hasEnabled && typeof payload.enabled !== 'boolean') || (hasCompact && typeof payload.compact !== 'boolean')) {
+              send(res, 400, { error: 'enabled and compact must be booleans' });
+              return;
+            }
+            if (hasEnabled) setSessionEnabledOf(sessionId, payload.enabled);
+            if (hasCompact) setSessionCompactOf(sessionId, payload.compact);
+            send(res, 200, { ok: true, session: sessionId, enabled: sessionEnabledOf(sessionId), compact: compactEnabledOf(sessionId) });
           } catch (error) {
             send(res, 400, { error: String(error?.message ?? error) });
           }
@@ -840,6 +1444,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const entry = JSON.parse(body || '{}');
@@ -885,6 +1490,7 @@ export function apply(ctx) {
             send(res, 405, { error: 'method not allowed' });
             return;
           }
+          if (!guardPost(req, res)) return;
           try {
             const body = await readBody(req, 4096);
             const payload = body.length === 0 ? {} : JSON.parse(body);
@@ -964,15 +1570,25 @@ export function apply(ctx) {
   registerStatusRoutes();
 
   ctx.effect(function* keepaliveLifecycle() {
-    appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
-    const timer = setInterval(() => {
-      try {
-        tick();
-      } catch (error) {
-        ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
+    try {
+      if (Object.prototype.hasOwnProperty.call(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')), 'maxTouches')) {
+        appendLog({ kind: 'config-notice', notice: 'maxTouches is no longer a setting: the keep-alive count is now derived from maxIdleMinutes / interval' });
       }
-    }, cfg.scanSeconds * 1000);
-    timer.unref?.();
+    } catch {
+      /* no config yet, or unreadable: nothing to report */
+    }
+    appendLog({ kind: 'start', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, routes: cfg.routes });
+    let timerSeconds = cfg.scanSeconds;
+    const startTimer = () => {
+      const t = setInterval(() => {
+        tick().catch((error) => {
+          ctx.logger?.warn?.('cache-keepalive: tick failed: ' + String(error?.message ?? error));
+        });
+      }, timerSeconds * 1000);
+      t.unref?.();
+      return t;
+    };
+    let timer = startTimer();
 
     let lastMtime = 0;
     try {
@@ -980,23 +1596,34 @@ export function apply(ctx) {
     } catch {
       lastMtime = 0;
     }
-    fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
+    const onConfigChange = () => {
       try {
         const next = loadConfig();
+        if (next === null) {
+          appendLog({ kind: 'config-error', error: 'config.json is not valid JSON; keeping the previous settings' });
+          return;
+        }
         const changed = JSON.stringify(next) !== JSON.stringify(cfg);
         cfg = next;
+        // scanSeconds is only read when the timer is created, so a change has to rebuild it.
+        if (cfg.scanSeconds !== timerSeconds) {
+          clearInterval(timer);
+          timerSeconds = cfg.scanSeconds;
+          timer = startTimer();
+        }
         if (changed) {
-          appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, maxTouches: cfg.maxTouches, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
+          appendLog({ kind: 'config', intervalMinutes: cfg.intervalMinutes, maxIdleMinutes: cfg.maxIdleMinutes, replayMaxTokens: cfg.replayMaxTokens, enabled: cfg.enabled, routes: cfg.routes });
         }
       } catch {
         /* keep previous config */
       }
-    });
+    };
+    fs.watchFile(CONFIG_PATH, { interval: 2000 }, onConfigChange);
 
     yield () => {
       clearInterval(timer);
       try {
-        fs.unwatchFile(CONFIG_PATH);
+        fs.unwatchFile(CONFIG_PATH, onConfigChange);
       } catch {
         /* already gone */
       }

@@ -1,18 +1,37 @@
 {
   "enabled": false,
   "sessionEnabled": {},
-  "intervalMinutes": 20,
-  "maxIdleMinutes": 150,
-  "maxTouches": 8,
+  "intervalMinutes": 4,
+  "maxIdleMinutes": 45,
+  "compactAfterMinutes": 20,
   "replayMaxTokens": 16,
-  "scanSeconds": 30,
-  "maxSessions": 1,
+  "scanSeconds": 15,
+  "maxSessions": 3,
   "routes": [
-    { "provider": "kimi-coding", "model": "kimi-k3.1-pro" }
+    {
+      "provider": "blsc-anthropic",
+      "model": "Claude-Sonnet-5.5"
+    },
+    {
+      "provider": "blsc-anthropic",
+      "model": "Claude-Opus-5.5"
+    }
   ],
   "routeIntervals": {
     "kimi-coding/kimi-k3.1-pro": 20,
-    "huosan/kimi-k3.1-pro": 5
+    "huosan/kimi-k3.1-pro": 4
   },
-  "requireProvenCache": true
+  "routeSettings": {
+    "blsc/GPT-6.1-Sol": {
+      "maxIdleMinutes": 90,
+      "compactMinTokens": 300000
+    }
+  },
+  "prices": {},
+  "requireProvenCache": true,
+  "compactEnabled": false,
+  "compactResetOnManual": true,
+  "compactSkipWhenBusy": true,
+  "compactMinTokens": 150000,
+  "sessionCompact": {}
 }
